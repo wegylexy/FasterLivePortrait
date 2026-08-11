@@ -68,6 +68,30 @@ class JoyVASAAudio2MotionPipeline:
         with open(motion_template_path, 'rb') as fin:
             self.templete_dict = pickle.load(fin)
 
+    @staticmethod
+    def _smooth_chunk_seams(motion_coef, stride, pose_slice=slice(63, 70), blend_frames=15):
+        """
+        JoyVASA generates motion in non-overlapping `stride`-frame chunks, conditioning
+        each chunk on a 10-frame summary of the previous one (soft attention context,
+        not a hard constraint) - so pose (scale/t/pitch/yaw/roll, channels 63:70) can
+        show a small absolute-value jump right at each chunk boundary. Downstream, pose
+        is computed relative to a single fixed anchor frame, so an uncorrected seam jump
+        becomes a permanent offset for the rest of the clip.
+
+        Cancel the jump at each seam, then fade the correction back out over
+        `blend_frames` so the sequence returns to the model's own trajectory instead of
+        carrying that offset indefinitely (which would otherwise compound seam-to-seam
+        over a long clip).
+        """
+        T = motion_coef.shape[1]
+        for b in range(stride, T, stride):
+            jump = motion_coef[:, b, pose_slice] - motion_coef[:, b - 1, pose_slice]
+            end = min(b + blend_frames, T)
+            for k, idx in enumerate(range(b, end)):
+                weight = 1.0 - k / blend_frames
+                motion_coef[:, idx, pose_slice] = motion_coef[:, idx, pose_slice] - jump * weight
+        return motion_coef
+
     @torch.inference_mode()
     def gen_motion_sequence(self, audio_path, **kwargs):
         # preprocess audio
@@ -139,6 +163,9 @@ class JoyVASAAudio2MotionPipeline:
             coef_list.append(motion_coef)
             motion_coef = torch.cat(coef_list, dim=1)
             # motion_coef = self.reformat_motion(args, motion_coef)
+
+        if n_subdivision > 1:
+            motion_coef = self._smooth_chunk_seams(motion_coef, stride)
 
         motion_coef = motion_coef.squeeze().cpu().numpy().astype(np.float32)
         motion_list = []

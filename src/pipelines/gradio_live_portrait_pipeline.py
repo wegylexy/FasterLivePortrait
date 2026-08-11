@@ -31,6 +31,10 @@ if platform.system().lower() == 'windows':
 else:
     FFMPEG = "ffmpeg"
 
+# -b:v/-maxrate combined with -cq deadlocks h264_nvenc on some ffmpeg/driver
+# combos (hangs at a fixed frame count instead of erroring) - CQ alone is stable.
+NVENC_ARGS = ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "19"]
+
 
 class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
     def __init__(self, cfg, **kwargs):
@@ -206,10 +210,9 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             fps = int(vcap.get(cv2.CAP_PROP_FPS))
 
         dframe = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if self.is_source_video:
-            max_frame = min(dframe, len(self.src_imgs))
-        else:
-            max_frame = dframe
+        # when driving is longer than source, wrap the source index (src_imgs/src_infos
+        # loop automatically) instead of truncating to the shorter of the two.
+        max_frame = dframe
         h, w = self.src_imgs[0].shape[:2]
         save_dir = f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
         os.makedirs(save_dir, exist_ok=True)
@@ -258,16 +261,18 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
                 duration, fps = utils.get_video_info(vsave_crop_path)
                 subprocess.call(
                     [FFMPEG, "-i", vsave_crop_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac", "-pix_fmt", "yuv420p",
+                     *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                     # the native aac encoder deadlocks on 16kHz mono input in this
+                     # ffmpeg build - resampling to 44100 avoids the encoder hang.
+                     "-c:a", "aac", "-ar", "44100", "-pix_fmt", "yuv420p",
                      "-shortest",  # 以最短的流为基准
                      "-t", str(duration),  # 设置时长
                      "-r", str(fps),  # 设置帧率
                      vsave_crop_path_new, "-y"])
                 subprocess.call(
                     [FFMPEG, "-i", vsave_org_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac", "-pix_fmt", "yuv420p",
+                     *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                     "-c:a", "aac", "-ar", "44100", "-pix_fmt", "yuv420p",
                      "-shortest",  # 以最短的流为基准
                      "-t", str(duration),  # 设置时长
                      "-r", str(fps),  # 设置帧率
@@ -275,15 +280,13 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             else:
                 subprocess.call(
                     [FFMPEG, "-i", vsave_crop_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v",
-                     "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac",
+                     *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                     "-c:a", "aac", "-ar", "44100",
                      "-pix_fmt", "yuv420p", vsave_crop_path_new, "-y", "-shortest"])
                 subprocess.call(
                     [FFMPEG, "-i", vsave_org_path, "-i", driving_video_path,
-                     "-b:v", "10M", "-c:v",
-                     "libx264", "-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac",
+                     *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                     "-c:a", "aac", "-ar", "44100",
                      "-pix_fmt", "yuv420p", vsave_org_path_new, "-y", "-shortest"])
 
             return vsave_org_path_new, vsave_crop_path_new, total_time
@@ -403,19 +406,23 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         duration, fps = utils.get_video_info(vsave_crop_path)
         subprocess.call(
             [FFMPEG, "-i", vsave_crop_path, "-i", driving_audio_path,
-             "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-             "-c:a", "aac", "-pix_fmt", "yuv420p",
+             *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+             # the native aac encoder deadlocks on 16kHz mono input in this
+             # ffmpeg build - resampling to 44100 avoids the encoder hang.
+             "-c:a", "aac", "-ar", "44100", "-pix_fmt", "yuv420p",
              "-shortest",  # 以最短的流为基准
              "-t", str(duration),  # 设置时长
-             "-r", str(fps),  # 设置帧率
+             "-r", "24",  # 设置帧率 (resample from JoyVASA's native 25fps)
              vsave_crop_path_new, "-y"])
         subprocess.call(
             [FFMPEG, "-i", vsave_org_path, "-i", driving_audio_path,
-             "-b:v", "10M", "-c:v", "libx264", "-map", "0:v", "-map", "1:a",
-             "-c:a", "aac", "-pix_fmt", "yuv420p",
+             *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+             # the native aac encoder deadlocks on 16kHz mono input in this
+             # ffmpeg build - resampling to 44100 avoids the encoder hang.
+             "-c:a", "aac", "-ar", "44100", "-pix_fmt", "yuv420p",
              "-shortest",  # 以最短的流为基准
              "-t", str(duration),  # 设置时长
-             "-r", str(fps),  # 设置帧率
+             "-r", "24",  # 设置帧率 (resample from JoyVASA's native 25fps)
              vsave_org_path_new, "-y"])
 
         return vsave_org_path_new, vsave_crop_path_new, time.time() - t00

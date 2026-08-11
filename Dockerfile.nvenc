@@ -1,0 +1,27 @@
+FROM shaoguo/faster_liveportrait:v3
+USER root
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# The distro ffmpeg (4.2.7, built ~2020) predates this driver's NVENC API and
+# fails with "Cannot get the preset configuration: unsupported param". Drop in
+# a current static build instead of rebuilding ffmpeg from source.
+RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils && \
+    wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -O /tmp/ffmpeg.tar.xz && \
+    tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
+    cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg && \
+    cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe && \
+    rm -rf /tmp/ffmpeg* && \
+    apt-get purge -y wget xz-utils && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+# requirements.txt also pulls in kokoro/misaki[ja] (TTS, needs a C++ toolchain
+# for pyopenjtalk) which JoyVASA's audio-driving path doesn't use; install only
+# what src/models/JoyVASA actually imports.
+# Pin below huggingface_hub's HfFolder removal (5.x) so gradio's older
+# `from huggingface_hub import HfFolder` import keeps working.
+RUN /root/miniconda3/bin/pip install "transformers<4.50" "huggingface_hub==0.23.5"
+
+WORKDIR /root/FasterLivePortrait
+COPY . /root/FasterLivePortrait
+
+CMD ["bash"]

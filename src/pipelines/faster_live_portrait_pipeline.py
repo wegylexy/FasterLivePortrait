@@ -22,6 +22,77 @@ from ..utils.utils import resize_to_limit, prepare_paste_back, get_rotation_matr
 from src.utils import utils
 
 
+class _LazySourceFrames:
+    """
+    List-like lazy accessor over a source video's decoded+preprocessed frames.
+    Keeps only the most recently accessed frame in memory (bounded, O(1) memory
+    regardless of source video length) instead of the previous behavior of
+    decoding and preprocessing every frame upfront in prepare_source, which for
+    a multi-minute source video could exhaust available RAM/VRAM.
+
+    Indexing past len(self) wraps around (loops the source), so a driving clip
+    longer than the source video no longer needs to be truncated to match.
+    """
+
+    def __init__(self, pipeline, source_path, process_kwargs):
+        self._pipeline = pipeline
+        self._process_kwargs = process_kwargs
+        self._cap = cv2.VideoCapture(source_path)
+        self._total = max(int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
+        self._read_cursor = 0  # frame index the VideoCapture will yield next via .read()
+        self._cache_idx = None
+        self._cache_img_rgb = None
+        self._cache_src_infos = None
+
+    def __len__(self):
+        return self._total
+
+    def _ensure(self, idx):
+        if self._total <= 0:
+            raise IndexError("source video has no frames")
+        real_idx = idx % self._total
+        if self._cache_idx == real_idx:
+            return
+        if real_idx != self._read_cursor:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, real_idx)
+            self._read_cursor = real_idx
+        ret, frame = self._cap.read()
+        self._read_cursor += 1
+        if not ret:
+            raise RuntimeError(f"failed to read source video frame {real_idx}")
+        processed = self._pipeline._process_source_frame(frame, **self._process_kwargs)
+        if processed is None:
+            # no face in this frame - reuse the last good frame rather than
+            # breaking the whole render (mirrors the old eager path's skip-on-miss)
+            if self._cache_img_rgb is None:
+                raise RuntimeError(f"no face detected in source video frame {real_idx}")
+            print(f"no face detected in source video frame {real_idx}, reusing previous frame")
+        else:
+            self._cache_img_rgb, self._cache_src_infos = processed
+        self._cache_idx = real_idx
+
+    def __getitem__(self, idx):
+        self._ensure(idx)
+        return self._cache_img_rgb
+
+    def get_infos(self, idx):
+        self._ensure(idx)
+        return self._cache_src_infos
+
+
+class _LazySourceInfos:
+    """Companion list-like view exposing the src_infos half of _LazySourceFrames."""
+
+    def __init__(self, frames):
+        self._frames = frames
+
+    def __len__(self):
+        return len(self._frames)
+
+    def __getitem__(self, idx):
+        return self._frames.get_infos(idx)
+
+
 class FasterLivePortraitPipeline:
     def __init__(self, cfg, **kwargs):
         self.cfg = cfg
@@ -124,145 +195,156 @@ class FasterLivePortraitPipeline:
         combined_lip_ratio_tensor = np.concatenate([c_s_lip, c_d_lip_i], axis=1)  # 1x2
         return combined_lip_ratio_tensor
 
+    def _process_source_frame(self, img_bgr, **kwargs):
+        """
+        Run face-detect/crop/motion-extract on a single source frame.
+        Returns (img_rgb, src_infos) or None if no face was detected.
+        Factored out of prepare_source so it can be called eagerly (still-image
+        source) or lazily on demand per-frame (video source, see _LazySourceFrames)
+        without materializing every frame of a long source video in memory at once.
+        """
+        img_bgr = resize_to_limit(img_bgr, self.cfg.infer_params.source_max_dim,
+                                  self.cfg.infer_params.source_division)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        src_faces = []
+        if self.is_animal:
+            with torch.no_grad():
+                img_rgb_pil = Image.fromarray(img_rgb)
+                lmk = self.model_dict["xpose"].run(
+                    img_rgb_pil,
+                    'face',
+                    'animal_face',
+                    0,
+                    0
+                )
+            if lmk is None:
+                return None
+            src_faces.append(lmk)
+        else:
+            src_faces = self.model_dict["face_analysis"].predict(img_bgr)
+            if len(src_faces) == 0:
+                print("No face detected in the this image.")
+                return None
+            # 如果是实时，只关注最大的那张脸
+            if kwargs.get("realtime", False):
+                src_faces = src_faces[:1]
+
+        crop_infos = []
+        for i in range(len(src_faces)):
+            # NOTE: temporarily only pick the first face, to support multiple face in the future
+            lmk = src_faces[i]
+            # crop the face
+            ret_dct = crop_image(
+                img_rgb,  # ndarray
+                lmk,  # 106x2 or Nx2
+                dsize=self.cfg.crop_params.src_dsize,
+                scale=self.cfg.crop_params.src_scale,
+                vx_ratio=self.cfg.crop_params.src_vx_ratio,
+                vy_ratio=self.cfg.crop_params.src_vy_ratio,
+            )
+            if self.is_animal:
+                ret_dct["lmk_crop"] = lmk
+            else:
+                lmk = self.model_dict["landmark"].predict(img_rgb, lmk)
+                ret_dct["lmk_crop"] = lmk
+                ret_dct["lmk_crop_256x256"] = ret_dct["lmk_crop"] * 256 / self.cfg.crop_params.src_dsize
+
+            # update a 256x256 version for network input
+            ret_dct["img_crop_256x256"] = cv2.resize(
+                ret_dct["img_crop"], (256, 256), interpolation=cv2.INTER_AREA
+            )
+            crop_infos.append(ret_dct)
+
+        src_infos = [[] for _ in range(len(crop_infos))]
+        for i, crop_info in enumerate(crop_infos):
+            source_lmk = crop_info['lmk_crop']
+            img_crop, img_crop_256x256 = crop_info['img_crop'], crop_info['img_crop_256x256']
+            pitch, yaw, roll, t, exp, scale, kp = self.model_dict["motion_extractor"].predict(
+                img_crop_256x256)
+            x_s_info = {
+                "pitch": pitch,
+                "yaw": yaw,
+                "roll": roll,
+                "t": t,
+                "exp": exp,
+                "scale": scale,
+                "kp": kp
+            }
+            src_infos[i].append(copy.deepcopy(x_s_info))
+            x_c_s = kp
+            R_s = get_rotation_matrix(pitch, yaw, roll)
+            f_s = self.model_dict["app_feat_extractor"].predict(img_crop_256x256)
+            x_s = transform_keypoint(pitch, yaw, roll, t, exp, scale, kp)
+            src_infos[i].extend([source_lmk.copy(), R_s.copy(), f_s.copy(), x_s.copy(), x_c_s.copy()])
+            if not self.is_animal:
+                flag_lip_zero = self.cfg.infer_params.flag_normalize_lip  # not overwrite
+                if flag_lip_zero:
+                    # let lip-open scalar to be 0 at first
+                    # 似乎要调参？
+                    c_d_lip_before_animation = [0.05]
+                    combined_lip_ratio_tensor_before_animation = self.calc_combined_lip_ratio(
+                        c_d_lip_before_animation, source_lmk.copy())
+                    if combined_lip_ratio_tensor_before_animation[0][
+                        0] < self.cfg.infer_params.lip_normalize_threshold:
+                        flag_lip_zero = False
+                        src_infos[i].append(None)
+                        src_infos[i].append(flag_lip_zero)
+                    else:
+                        lip_delta_before_animation = self.model_dict['stitching_lip_retarget'].predict(
+                            concat_feat(x_s, combined_lip_ratio_tensor_before_animation))
+                        src_infos[i].append(lip_delta_before_animation.copy())
+                        src_infos[i].append(flag_lip_zero)
+                else:
+                    src_infos[i].append(None)
+                    src_infos[i].append(flag_lip_zero)
+            else:
+                src_infos[i].append(None)
+                src_infos[i].append(False)
+
+            ######## prepare for pasteback ########
+            if self.cfg.infer_params.flag_pasteback and self.cfg.infer_params.flag_do_crop and self.cfg.infer_params.flag_stitching:
+                mask_ori_float = prepare_paste_back(self.mask_crop, crop_info['M_c2o'],
+                                                    dsize=(img_rgb.shape[1], img_rgb.shape[0]))
+                mask_ori_float = torch.from_numpy(mask_ori_float).to(self.device)
+                src_infos[i].append(mask_ori_float)
+            else:
+                src_infos[i].append(None)
+            M = torch.from_numpy(crop_info['M_c2o']).to(self.device)
+            src_infos[i].append(M)
+        return img_rgb, src_infos
+
     def prepare_source(self, source_path, **kwargs):
         print(f"process source:{source_path} >>>>>>>>")
         try:
-            if utils.is_video(source_path):
-                self.is_source_video = True
-            else:
-                self.is_source_video = False
-
-            if self.is_source_video:
-                src_imgs_bgr = []
-                src_vcap = cv2.VideoCapture(source_path)
-                while True:
-                    ret, frame = src_vcap.read()
-                    if not ret:
-                        break
-                    src_imgs_bgr.append(frame)
-                src_vcap.release()
-            else:
-                img_bgr = cv2.imread(source_path, cv2.IMREAD_COLOR)
-                src_imgs_bgr = [img_bgr]
-
-            self.src_imgs = []
-            self.src_infos = []
+            self.is_source_video = utils.is_video(source_path)
             self.source_path = source_path
 
-            for ii, img_bgr in tqdm(enumerate(src_imgs_bgr), total=len(src_imgs_bgr)):
-                img_bgr = resize_to_limit(img_bgr, self.cfg.infer_params.source_max_dim,
-                                          self.cfg.infer_params.source_division)
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                src_faces = []
-                if self.is_animal:
-                    with torch.no_grad():
-                        img_rgb_pil = Image.fromarray(img_rgb)
-                        lmk = self.model_dict["xpose"].run(
-                            img_rgb_pil,
-                            'face',
-                            'animal_face',
-                            0,
-                            0
-                        )
-                    if lmk is None:
-                        continue
-                    self.src_imgs.append(img_rgb)
-                    src_faces.append(lmk)
+            if self.is_source_video:
+                self.src_imgs = _LazySourceFrames(self, source_path, kwargs)
+                self.src_infos = _LazySourceInfos(self.src_imgs)
+                # process frame 0 eagerly, both to validate a face is present
+                # and to warm the cache other callers rely on immediately
+                # (e.g. `pipe.src_imgs[0].shape[:2]`) after prepare_source returns.
+                try:
+                    self.src_imgs[0]
+                    ok = True
+                except (IndexError, RuntimeError) as e:
+                    print(f"source video has no usable frames: {e}")
+                    ok = False
+            else:
+                img_bgr = cv2.imread(source_path, cv2.IMREAD_COLOR)
+                processed = self._process_source_frame(img_bgr, **kwargs)
+                ok = processed is not None
+                if ok:
+                    img_rgb, src_infos = processed
+                    self.src_imgs = [img_rgb]
+                    self.src_infos = [src_infos]
                 else:
-                    src_faces = self.model_dict["face_analysis"].predict(img_bgr)
-                    if len(src_faces) == 0:
-                        print("No face detected in the this image.")
-                        continue
-                    self.src_imgs.append(img_rgb)
-                    # 如果是实时，只关注最大的那张脸
-                    if kwargs.get("realtime", False):
-                        src_faces = src_faces[:1]
+                    self.src_imgs = []
+                    self.src_infos = []
 
-                crop_infos = []
-                for i in range(len(src_faces)):
-                    # NOTE: temporarily only pick the first face, to support multiple face in the future
-                    lmk = src_faces[i]
-                    # crop the face
-                    ret_dct = crop_image(
-                        img_rgb,  # ndarray
-                        lmk,  # 106x2 or Nx2
-                        dsize=self.cfg.crop_params.src_dsize,
-                        scale=self.cfg.crop_params.src_scale,
-                        vx_ratio=self.cfg.crop_params.src_vx_ratio,
-                        vy_ratio=self.cfg.crop_params.src_vy_ratio,
-                    )
-                    if self.is_animal:
-                        ret_dct["lmk_crop"] = lmk
-                    else:
-                        lmk = self.model_dict["landmark"].predict(img_rgb, lmk)
-                        ret_dct["lmk_crop"] = lmk
-                        ret_dct["lmk_crop_256x256"] = ret_dct["lmk_crop"] * 256 / self.cfg.crop_params.src_dsize
-
-                    # update a 256x256 version for network input
-                    ret_dct["img_crop_256x256"] = cv2.resize(
-                        ret_dct["img_crop"], (256, 256), interpolation=cv2.INTER_AREA
-                    )
-                    crop_infos.append(ret_dct)
-
-                src_infos = [[] for _ in range(len(crop_infos))]
-                for i, crop_info in enumerate(crop_infos):
-                    source_lmk = crop_info['lmk_crop']
-                    img_crop, img_crop_256x256 = crop_info['img_crop'], crop_info['img_crop_256x256']
-                    pitch, yaw, roll, t, exp, scale, kp = self.model_dict["motion_extractor"].predict(
-                        img_crop_256x256)
-                    x_s_info = {
-                        "pitch": pitch,
-                        "yaw": yaw,
-                        "roll": roll,
-                        "t": t,
-                        "exp": exp,
-                        "scale": scale,
-                        "kp": kp
-                    }
-                    src_infos[i].append(copy.deepcopy(x_s_info))
-                    x_c_s = kp
-                    R_s = get_rotation_matrix(pitch, yaw, roll)
-                    f_s = self.model_dict["app_feat_extractor"].predict(img_crop_256x256)
-                    x_s = transform_keypoint(pitch, yaw, roll, t, exp, scale, kp)
-                    src_infos[i].extend([source_lmk.copy(), R_s.copy(), f_s.copy(), x_s.copy(), x_c_s.copy()])
-                    if not self.is_animal:
-                        flag_lip_zero = self.cfg.infer_params.flag_normalize_lip  # not overwrite
-                        if flag_lip_zero:
-                            # let lip-open scalar to be 0 at first
-                            # 似乎要调参？
-                            c_d_lip_before_animation = [0.05]
-                            combined_lip_ratio_tensor_before_animation = self.calc_combined_lip_ratio(
-                                c_d_lip_before_animation, source_lmk.copy())
-                            if combined_lip_ratio_tensor_before_animation[0][
-                                0] < self.cfg.infer_params.lip_normalize_threshold:
-                                flag_lip_zero = False
-                                src_infos[i].append(None)
-                                src_infos[i].append(flag_lip_zero)
-                            else:
-                                lip_delta_before_animation = self.model_dict['stitching_lip_retarget'].predict(
-                                    concat_feat(x_s, combined_lip_ratio_tensor_before_animation))
-                                src_infos[i].append(lip_delta_before_animation.copy())
-                                src_infos[i].append(flag_lip_zero)
-                        else:
-                            src_infos[i].append(None)
-                            src_infos[i].append(flag_lip_zero)
-                    else:
-                        src_infos[i].append(None)
-                        src_infos[i].append(False)
-
-                    ######## prepare for pasteback ########
-                    if self.cfg.infer_params.flag_pasteback and self.cfg.infer_params.flag_do_crop and self.cfg.infer_params.flag_stitching:
-                        mask_ori_float = prepare_paste_back(self.mask_crop, crop_info['M_c2o'],
-                                                            dsize=(img_rgb.shape[1], img_rgb.shape[0]))
-                        mask_ori_float = torch.from_numpy(mask_ori_float).to(self.device)
-                        src_infos[i].append(mask_ori_float)
-                    else:
-                        src_infos[i].append(None)
-                    M = torch.from_numpy(crop_info['M_c2o']).to(self.device)
-                    src_infos[i].append(M)
-                self.src_infos.append(src_infos[:])
             print(f"finish process source:{source_path} >>>>>>>>")
-            return len(self.src_infos) > 0
+            return ok
         except Exception as e:
             traceback.print_exc()
             return False
@@ -340,7 +422,11 @@ class FasterLivePortraitPipeline:
             if self.cfg.infer_params.flag_relative_motion:
                 if self.cfg.infer_params.animation_region in ["all", "pose"]:
                     if self.is_source_video:
-                        R_new = self.R_d_smooth.process(R_d_i)
+                        # same relative-rotation formula as the still-image branch below
+                        # (driving's rotation relative to ITS OWN frame-0, composed onto
+                        # source's own rotation) - smoothed after composing, not before,
+                        # so R_s isn't discarded the way the old substitution did.
+                        R_new = self.R_d_smooth.process((R_d_i @ np.transpose(R_d_0, (0, 2, 1))) @ R_s)
                     else:
                         R_new = (R_d_i @ np.transpose(R_d_0, (0, 2, 1))) @ R_s
                 else:
@@ -350,27 +436,35 @@ class FasterLivePortraitPipeline:
                 x_d_exp_smooth = x_d_i_info['exp'].copy()
                 if self.is_source_video:
                     x_d_exp_smooth = self.exp_smooth.process(x_d_exp_smooth)
+                # relative-motion delta: source's own baseline plus how far the driving
+                # frame has moved from ITS OWN frame-0 baseline. The is_source_video branch
+                # used to substitute x_d_exp_smooth (driving's raw/smoothed absolute value)
+                # directly, discarding x_s_info['exp'] entirely and never subtracting
+                # driving's frame-0 baseline - that desyncs frame 0 (no longer guaranteed
+                # closed-mouth even if source's own rest pose is) and undershoots amplitude
+                # for anyone whose resting exp differs from the driving identity's.
+                x_d_exp_rel = x_s_info['exp'] + (x_d_exp_smooth - x_d_0_info['exp'])
                 if self.cfg.infer_params.animation_region in ["all", "exp"]:
                     if self.is_source_video:
                         for idx in [1, 2, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]:
-                            delta_new[:, idx, :] = x_d_exp_smooth[:, idx, :]
-                        delta_new[:, 3:5, 1] = x_d_exp_smooth[:, 3:5, 1]
-                        delta_new[:, 5, 2] = x_d_exp_smooth[:, 5, 2]
-                        delta_new[:, 8, 2] = x_d_exp_smooth[:, 8, 2]
-                        delta_new[:, 9, 1:] = x_d_exp_smooth[:, 9, 1:]
+                            delta_new[:, idx, :] = x_d_exp_rel[:, idx, :]
+                        delta_new[:, 3:5, 1] = x_d_exp_rel[:, 3:5, 1]
+                        delta_new[:, 5, 2] = x_d_exp_rel[:, 5, 2]
+                        delta_new[:, 8, 2] = x_d_exp_rel[:, 8, 2]
+                        delta_new[:, 9, 1:] = x_d_exp_rel[:, 9, 1:]
                     else:
                         delta_new = x_s_info['exp'] + (x_d_i_info['exp'] - x_d_0_info['exp'])
                 elif self.cfg.infer_params.animation_region in ["lip"]:
                     for lip_idx in [6, 12, 14, 17, 19, 20]:
                         if self.is_source_video:
-                            delta_new[:, lip_idx, :] = x_d_exp_smooth[:, lip_idx, :]
+                            delta_new[:, lip_idx, :] = x_d_exp_rel[:, lip_idx, :]
                         else:
                             delta_new[:, lip_idx, :] = (x_s_info['exp'] + (x_d_i_info['exp'] - x_d_0_info['exp']))[:,
                                                        lip_idx, :]
                 elif self.cfg.infer_params.animation_region in ["eyes"]:
                     for eyes_idx in [11, 13, 15, 16, 18]:
                         if self.is_source_video:
-                            delta_new[:, eyes_idx, :] = x_d_exp_smooth[:, eyes_idx, :]
+                            delta_new[:, eyes_idx, :] = x_d_exp_rel[:, eyes_idx, :]
                         else:
                             delta_new[:, eyes_idx, :] = (x_s_info['exp'] + (x_d_i_info['exp'] - x_d_0_info['exp']))[:,
                                                         eyes_idx, :]

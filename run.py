@@ -43,6 +43,10 @@ if platform.system().lower() == 'windows':
 else:
     FFMPEG = "ffmpeg"
 
+# -b:v/-maxrate combined with -cq deadlocks h264_nvenc on some ffmpeg/driver
+# combos (hangs at a fixed frame count instead of erroring) - CQ alone is stable.
+NVENC_ARGS = ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "19"]
+
 
 def run_with_video(args):
     print(Fore.RED+'Render,  Q > exit,  S > Stitching,  Z > RelativeMotion,  X > AnimationRegion,  C > CropDrivingVideo, KL > AdjustSourceScale, NM > AdjustDriverScale,  Space > Webcamassource,  R > SwitchRealtimeWebcamUpdate'+Style.RESET_ALL)
@@ -127,16 +131,14 @@ def run_with_video(args):
             vsave_crop_path_new = os.path.splitext(vsave_crop_path)[0] + "-audio.mp4"
             subprocess.call(
                 [FFMPEG, "-i", vsave_crop_path, "-i", args.dri_video,
-                 "-b:v", "10M", "-c:v",
-                 "libx264", "-map", "0:v", "-map", "1:a",
-                 "-c:a", "aac",
+                 *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                 "-c:a", "aac", "-ar", "44100",
                  "-pix_fmt", "yuv420p", vsave_crop_path_new, "-y", "-shortest"])
             vsave_org_path_new = os.path.splitext(vsave_org_path)[0] + "-audio.mp4"
             subprocess.call(
                 [FFMPEG, "-i", vsave_org_path, "-i", args.dri_video,
-                 "-b:v", "10M", "-c:v",
-                 "libx264", "-map", "0:v", "-map", "1:a",
-                 "-c:a", "aac",
+                 *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                 "-c:a", "aac", "-ar", "44100",
                  "-pix_fmt", "yuv420p", vsave_org_path_new, "-y", "-shortest"])
 
             print(vsave_crop_path_new)
@@ -279,16 +281,14 @@ def run_with_pkl(args):
             vsave_crop_path_new = os.path.splitext(vsave_crop_path)[0] + "-audio.mp4"
             subprocess.call(
                 [FFMPEG, "-i", vsave_crop_path, "-i", args.dri_video,
-                 "-b:v", "10M", "-c:v",
-                 "libx264", "-map", "0:v", "-map", "1:a",
-                 "-c:a", "aac",
+                 *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                 "-c:a", "aac", "-ar", "44100",
                  "-pix_fmt", "yuv420p", vsave_crop_path_new, "-y", "-shortest"])
             vsave_org_path_new = os.path.splitext(vsave_org_path)[0] + "-audio.mp4"
             subprocess.call(
                 [FFMPEG, "-i", vsave_org_path, "-i", args.dri_video,
-                 "-b:v", "10M", "-c:v",
-                 "libx264", "-map", "0:v", "-map", "1:a",
-                 "-c:a", "aac",
+                 *NVENC_ARGS, "-map", "0:v", "-map", "1:a",
+                 "-c:a", "aac", "-ar", "44100",
                  "-pix_fmt", "yuv420p", vsave_org_path_new, "-y", "-shortest"])
 
             print(vsave_crop_path_new)

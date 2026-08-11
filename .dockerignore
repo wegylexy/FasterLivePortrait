@@ -1,0 +1,6 @@
+.git
+checkpoints
+results
+tmp
+__pycache__
+*.pyc
