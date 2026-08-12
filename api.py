@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from zipfile import ZipFile
 from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline
 from src.utils.utils import video_has_audio
+from src.utils.nvdec_capture import open_video_capture
 from src.utils import logger
 
 # model dir
@@ -197,7 +198,8 @@ def run_with_video(source_image_path, driving_video_path, save_dir):
     if not ret:
         logger_f.warning(f"no face in {source_image_path}! exit!")
         return
-    vcap = cv2.VideoCapture(driving_video_path)
+    use_nvdec = getattr(pipe.cfg.infer_params, "flag_use_nvdec", False)
+    vcap = open_video_capture(driving_video_path, use_nvdec=use_nvdec)
     fps = int(vcap.get(cv2.CAP_PROP_FPS))
     h, w = pipe.src_imgs[0].shape[:2]
 

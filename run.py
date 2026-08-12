@@ -37,6 +37,7 @@ from tqdm import tqdm
 from colorama import Fore, Back, Style
 from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline
 from src.utils.utils import video_has_audio
+from src.utils.nvdec_capture import open_video_capture
 
 if platform.system().lower() == 'windows':
     FFMPEG = "third_party/ffmpeg-7.0.1-full_build/bin/ffmpeg.exe"
@@ -65,7 +66,8 @@ def run_with_video(args):
             print("no camera found! exit!")
             exit(1)
     else:
-        vcap = cv2.VideoCapture(args.dri_video)
+        use_nvdec = getattr(infer_cfg.infer_params, "flag_use_nvdec", False)
+        vcap = open_video_capture(args.dri_video, use_nvdec=use_nvdec)
     fps = int(vcap.get(cv2.CAP_PROP_FPS))
     h, w = pipe.src_imgs[0].shape[:2]
     save_dir = f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}"

@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3-pip python3-dev git wget xz-utils \
-        libgl1 libglib2.0-0 build-essential \
+        libgl1 libglib2.0-0 build-essential libsndfile1 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python
 
@@ -42,6 +42,7 @@ RUN pip install --no-cache-dir \
         "transformers<4.50" \
         pykalman \
         tqdm \
+        soundfile \
     && pip uninstall -y onnxruntime \
     && pip install --no-cache-dir onnxruntime-gpu==1.17.0 \
     && pip install --no-cache-dir "numpy==1.26.4"

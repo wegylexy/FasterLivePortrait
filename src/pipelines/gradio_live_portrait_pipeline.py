@@ -22,6 +22,7 @@ from ..utils.utils import resize_to_limit, prepare_paste_back, get_rotation_matr
     calc_eye_close_ratio, transform_keypoint, concat_feat
 from ..utils.crop import crop_image, parse_bbox_from_landmark, crop_image_by_bbox, paste_back, paste_back_pytorch
 from src.utils import utils
+from src.utils.nvdec_capture import open_video_capture
 import platform
 import torch
 from PIL import Image
@@ -202,7 +203,8 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
             if not ret:
                 raise gr.Error(f"Error in processing source:{source_path} 💥!", duration=5)
 
-        vcap = cv2.VideoCapture(driving_video_path)
+        use_nvdec = getattr(self.cfg.infer_params, "flag_use_nvdec", False)
+        vcap = open_video_capture(driving_video_path, use_nvdec=use_nvdec)
         if self.is_source_video:
             duration, fps = utils.get_video_info(self.source_path)
             fps = int(fps)
@@ -306,11 +308,12 @@ class GradioLivePortraitPipeline(FasterLivePortraitPipeline):
         with open(driving_pickle_path, "rb") as fin:
             dri_motion_infos = pickle.load(fin)
 
-        if self.is_source_video:
-            duration, fps = utils.get_video_info(self.source_path)
-            fps = int(fps)
-        else:
-            fps = int(dri_motion_infos["output_fps"])
+        # output_fps reflects the rate the driving motion sequence was actually
+        # generated/extracted at (set by run.py for real driving videos and by
+        # JoyVASA's audio-to-motion pipeline alike) - using the source video's own
+        # fps here instead caused an accumulating audio/video desync whenever it
+        # differed from the driving motion's real fps (e.g. JoyVASA's 25fps).
+        fps = int(dri_motion_infos["output_fps"])
 
         motion_lst = dri_motion_infos["motion"]
         c_eyes_lst = dri_motion_infos["c_eyes_lst"] if "c_eyes_lst" in dri_motion_infos else dri_motion_infos[

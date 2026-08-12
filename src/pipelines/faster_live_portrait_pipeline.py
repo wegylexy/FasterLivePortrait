@@ -20,6 +20,7 @@ from ..utils.crop import crop_image, parse_bbox_from_landmark, crop_image_by_bbo
 from ..utils.utils import resize_to_limit, prepare_paste_back, get_rotation_matrix, calc_lip_close_ratio, \
     calc_eye_close_ratio, transform_keypoint, concat_feat
 from src.utils import utils
+from src.utils.nvdec_capture import open_video_capture
 
 
 class _LazySourceFrames:
@@ -34,10 +35,10 @@ class _LazySourceFrames:
     longer than the source video no longer needs to be truncated to match.
     """
 
-    def __init__(self, pipeline, source_path, process_kwargs):
+    def __init__(self, pipeline, source_path, process_kwargs, use_nvdec=True):
         self._pipeline = pipeline
         self._process_kwargs = process_kwargs
-        self._cap = cv2.VideoCapture(source_path)
+        self._cap = open_video_capture(source_path, use_nvdec=use_nvdec)
         self._total = max(int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
         self._read_cursor = 0  # frame index the VideoCapture will yield next via .read()
         self._cache_idx = None
@@ -320,7 +321,8 @@ class FasterLivePortraitPipeline:
             self.source_path = source_path
 
             if self.is_source_video:
-                self.src_imgs = _LazySourceFrames(self, source_path, kwargs)
+                use_nvdec = getattr(self.cfg.infer_params, "flag_use_nvdec", False)
+                self.src_imgs = _LazySourceFrames(self, source_path, kwargs, use_nvdec=use_nvdec)
                 self.src_infos = _LazySourceInfos(self.src_imgs)
                 # process frame 0 eagerly, both to validate a face is present
                 # and to warm the cache other callers rely on immediately

@@ -5,6 +5,16 @@ This is `wegylexy/FasterLivePortrait`, forked 2026-08-10 to replace the
 as the base project, since FasterLivePortrait uses ONNX/TensorRT inference
 instead of raw PyTorch and is significantly faster.
 
+**Measured this session** (same source/driving clip, same
+`--flag-normalize-lip --animation-region lip --driving-multiplier 1.2`, 240
+frames, one GPU, CPU-decode in both cases): FasterLivePortrait (this fork)
+finished in **48.9–55.3s** vs. **306.1s** for the non-Faster PyTorch fork —
+about **5.5–6.3x faster** — while also using less RAM (~1.2–1.5 GiB vs.
+~3.4–3.5 GiB) and less VRAM (~2.3 GB vs. ~7.8 GB). The one place it costs
+more is CPU core usage during the render (~7.7–8.3 cores sustained here vs.
+~1.4 for the non-Faster fork), which is expected — TensorRT's own
+pre/post-processing threads — but for a fraction of the wall-clock time.
+
 ## Actual use case
 
 Drive an already-recorded source video (natural head motion) with a
