@@ -49,10 +49,28 @@ else:
 NVENC_ARGS = ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "19"]
 
 
+def apply_cli_overrides(infer_cfg, args):
+    """Apply non-Faster-fork-CLI-compatible flags on top of --cfg, if passed."""
+    if getattr(args, "paste_back", None) is not None:
+        infer_cfg.infer_params.flag_pasteback = args.paste_back
+    if args.flag_normalize_lip is not None:
+        infer_cfg.infer_params.flag_normalize_lip = args.flag_normalize_lip
+    if args.animation_region is not None:
+        infer_cfg.infer_params.animation_region = args.animation_region
+    if args.driving_multiplier is not None:
+        infer_cfg.infer_params.driving_multiplier = args.driving_multiplier
+
+
+def resolve_save_dir(args):
+    save_dir = args.output_dir or f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
+
 def run_with_video(args):
     print(Fore.RED+'Render,  Q > exit,  S > Stitching,  Z > RelativeMotion,  X > AnimationRegion,  C > CropDrivingVideo, KL > AdjustSourceScale, NM > AdjustDriverScale,  Space > Webcamassource,  R > SwitchRealtimeWebcamUpdate'+Style.RESET_ALL)
     infer_cfg = OmegaConf.load(args.cfg)
-    infer_cfg.infer_params.flag_pasteback = args.paste_back
+    apply_cli_overrides(infer_cfg, args)
 
     pipe = FasterLivePortraitPipeline(cfg=infer_cfg, is_animal=args.animal)
     ret = pipe.prepare_source(args.src_image, realtime=args.realtime)
@@ -70,8 +88,7 @@ def run_with_video(args):
         vcap = open_video_capture(args.dri_video, use_nvdec=use_nvdec)
     fps = int(vcap.get(cv2.CAP_PROP_FPS))
     h, w = pipe.src_imgs[0].shape[:2]
-    save_dir = f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
-    os.makedirs(save_dir, exist_ok=True)
+    save_dir = resolve_save_dir(args)
 
     # render output video
     if not args.realtime:
@@ -95,7 +112,8 @@ def run_with_video(args):
             break
         t0 = time.time()
         first_frame = frame_ind == 0
-        dri_crop, out_crop, out_org, dri_motion_info = pipe.run(frame, pipe.src_imgs[0], pipe.src_infos[0],
+        src_idx = frame_ind if pipe.is_source_video else 0
+        dri_crop, out_crop, out_org, dri_motion_info = pipe.run(frame, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
                                                                 first_frame=first_frame)
         frame_ind += 1
         if out_crop is None:
@@ -171,7 +189,7 @@ def run_with_video(args):
 
 def run_with_pkl(args):
     infer_cfg = OmegaConf.load(args.cfg)
-    infer_cfg.infer_params.flag_pasteback = args.paste_back
+    apply_cli_overrides(infer_cfg, args)
 
     pipe = FasterLivePortraitPipeline(cfg=infer_cfg, is_animal=args.animal)
     ret = pipe.prepare_source(args.src_image, realtime=args.realtime)
@@ -183,8 +201,7 @@ def run_with_pkl(args):
 
     fps = int(dri_motion_infos["output_fps"])
     h, w = pipe.src_imgs[0].shape[:2]
-    save_dir = f"./results/{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
-    os.makedirs(save_dir, exist_ok=True)
+    save_dir = resolve_save_dir(args)
 
     # render output video
     if not args.realtime:
@@ -207,7 +224,8 @@ def run_with_pkl(args):
         t0 = time.time()
         first_frame = frame_ind == 0
         dri_motion_info_ = [motion_lst[frame_ind], c_eyes_lst[frame_ind], c_lip_lst[frame_ind]]
-        out_crop, out_org = pipe.run_with_pkl(dri_motion_info_, pipe.src_imgs[0], pipe.src_infos[0],
+        src_idx = frame_ind if pipe.is_source_video else 0
+        out_crop, out_org = pipe.run_with_pkl(dri_motion_info_, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
                                               first_frame=first_frame)
         if out_crop is None:
             print(f"no face in driving frame:{frame_ind}")
@@ -308,14 +326,30 @@ def run_with_pkl(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Faster Live Portrait Pipeline')
-    parser.add_argument('--src_image', required=False, type=str, default="assets/examples/source/s12.jpg",
+    parser.add_argument('-s', '--src_image', required=False, type=str, default="assets/examples/source/s12.jpg",
                         help='source image')
-    parser.add_argument('--dri_video', required=False, type=str, default="assets/examples/driving/d14.mp4",
+    parser.add_argument('-d', '--dri_video', required=False, type=str, default="assets/examples/driving/d14.mp4",
                         help='driving video')
+    parser.add_argument('-o', '--output_dir', required=False, type=str, default=None,
+                        help='output directory (default: auto-timestamped under ./results)')
     parser.add_argument('--cfg', required=False, type=str, default="configs/onnx_infer.yaml", help='inference config')
     parser.add_argument('--realtime', action='store_true', help='realtime inference')
     parser.add_argument('--animal', action='store_true', help='use animal model')
-    parser.add_argument('--paste_back', action='store_true', default=False, help='paste back to origin image')
+    parser.add_argument('--paste_back', action='store_true', default=None,
+                        help='paste back to origin image (overrides --cfg; if not passed, --cfg\'s own '
+                             'flag_pasteback value is used unchanged)')
+    # non-Faster-LivePortrait-CLI-compatible overrides (same flag names as
+    # that fork's inference.py) - only applied if actually passed, otherwise
+    # the --cfg file's own infer_params values are used unchanged.
+    parser.add_argument('--flag-normalize-lip', dest='flag_normalize_lip', action='store_true', default=None,
+                        help='normalize lip (overrides --cfg)')
+    parser.add_argument('--animation-region', dest='animation_region', required=False, type=str, default=None,
+                        choices=['exp', 'pose', 'lip', 'eyes', 'all'], help='animation region (overrides --cfg)')
+    parser.add_argument('--driving-multiplier', dest='driving_multiplier', required=False, type=float, default=None,
+                        help='driving multiplier (overrides --cfg)')
+    parser.add_argument('--video-chunk-size', required=False, type=int, default=None,
+                        help='no-op here - this fork streams frames instead of chunking, kept only for '
+                             'drop-in CLI compatibility with the non-Faster fork')
     args, unknown = parser.parse_known_args()
 
     if args.dri_video.endswith(".pkl"):

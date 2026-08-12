@@ -1,11 +1,25 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+# Leanest image for the actual CI use case: run.py's human/lip-only,
+# TensorRT-only (predict_type: trt) video-driving path. No multi-stage
+# builder needed - pycuda (the only thing that needed nvcc) turned out to
+# be entirely unused dead weight (grep across the whole repo finds zero
+# imports of it; TensorRT execution goes through the tensorrt Python API's
+# own context/buffer handling, not pycuda). torchvision/torchaudio are also
+# dropped: torchvision is only pulled in by the animal (XPose) path's lazy
+# import, torchaudio only by JoyVASA/the gradio pipeline - neither is ever
+# imported by run.py's actual call chain (FasterLivePortraitPipeline).
+# Similarly gradio/huggingface_hub/transformers/pykalman/soundfile are
+# JoyVASA/gradio-pipeline-only and dropped. mediapipe stays required even
+# though our config never selects it - src/models/__init__.py imports it
+# unconditionally at module load time.
+
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip python3-dev git wget xz-utils \
-        libgl1 libglib2.0-0 build-essential libsndfile1 \
+        python3.10 python3-pip git wget xz-utils \
+        libgl1 libglib2.0-0 libsndfile1 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python
 
@@ -18,31 +32,27 @@ RUN wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpe
     rm -rf /tmp/ffmpeg*
 
 RUN pip install --no-cache-dir \
-        torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+        torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 
-# mediapipe/others pull in plain CPU-only onnxruntime as a transitive dep,
-# which shares onnxruntime-gpu's import namespace and silently wins if it
-# installs after onnxruntime-gpu. Uninstall it and reinstall the GPU build
-# at the end of this SAME layer (not a separate RUN) so the discarded CPU
-# wheel's bytes never get committed to a layer in the first place.
+# mediapipe pulls in plain CPU-only onnxruntime as a transitive dep, which
+# shares onnxruntime-gpu's import namespace and silently wins if it installs
+# after onnxruntime-gpu. Uninstall it and reinstall the GPU build at the end
+# of this SAME layer (not a separate RUN) so the discarded CPU wheel's
+# bytes never get committed to a layer in the first place.
 RUN pip install --no-cache-dir \
         tensorrt==8.6.1 \
         onnx \
-        pycuda \
         numpy==1.26.4 \
         opencv-python \
-        gradio \
         scikit-image \
         insightface \
-        "huggingface_hub[cli]==0.23.5" \
         mediapipe \
         torchgeometry \
-        omegaconf \
         ffmpeg-python \
-        "transformers<4.50" \
-        pykalman \
+        colorama \
+        omegaconf \
         tqdm \
-        soundfile \
+        Pillow \
     && pip uninstall -y onnxruntime \
     && pip install --no-cache-dir onnxruntime-gpu==1.17.0 \
     && pip install --no-cache-dir "numpy==1.26.4"

@@ -28,6 +28,20 @@ Known-good settings (matching the real CI's `inference.py` flags):
 `--flag-normalize-lip --animation-region lip --driving-multiplier 1.2`.
 See `configs/trt_infer_lip_ci.yaml`.
 
+**`run.py`'s CLI is now drop-in compatible with that CI invocation shape**
+(it wasn't originally — this fork's CLI used `--src_image`/`--dri_video`/
+`--cfg <yaml>` with no direct equivalent of the non-Faster fork's
+`-s`/`-d`/`-o` + per-flag overrides). Added `-s`/`-d` as short aliases,
+`-o`/`--output_dir` to write to a fixed directory instead of an
+auto-timestamped `./results/...` one, and `--flag-normalize-lip`/
+`--animation-region`/`--driving-multiplier` as CLI overrides on top of
+`--cfg` (only applied if actually passed). `--video-chunk-size` is accepted
+and ignored (documented no-op) since this fork streams frames instead of
+chunking. Verified end-to-end:
+`python run.py -s <portrait> -d <driving> -o <dir> --cfg configs/trt_infer_lip_ci.yaml --flag-normalize-lip --animation-region lip --driving-multiplier 1.2 --video-chunk-size 512`
+works exactly like the old `inference.py` call, just swapping the image and
+script name — so migrating that CI job is a one-line change, not a rewrite.
+
 JoyVASA (audio-driven, no separate lip-sync step) was tried as an alternative
 to the Wav2Lip+FasterLivePortrait combo — **re-tested this session after the
 relative-motion bug fix below, still worse than Wav2Lip, deprioritized.**
@@ -128,10 +142,82 @@ use case.
      10.0.1.6 at tag `24.05` — anything from around there onward ships
      TensorRT ≥10.x, which is incompatible with the precompiled `grid_sample`
      plugin (README explicitly warns TensorRT ≥10.x doesn't work with it).
-     `nvcr.io/nvidia/tensorrt:24.01-py3` (TensorRT `8.6.1.6` exactly, ~4GB) is
-     a plausible smaller alternative base worth trying later, but would need
-     re-verifying `torch`/`onnxruntime-gpu` wheel compatibility against its
-     CUDA 12.3 instead of the current 11.8.
+   - Also rejected `nvcr.io/nvidia/tensorrt:24.01-py3` (TensorRT `8.6.1.6`
+     exactly): its cuDNN is `8.9.7`, but `onnxruntime-gpu`'s CUDA 12 wheels
+     require cuDNN 9 — no CUDA-12-with-cuDNN-8 combo exists for it. At 12GB
+     uncompressed it also isn't smaller than what we needed anyway once our
+     deps go on top.
+
+5. **Slim image shrunk further, 31.4GB → 23.7GB, via a real multi-stage
+   build** (still `Dockerfile.slim` — this replaced the single-stage version
+   from point 4 above). `pycuda`'s C-extension is the only thing that
+   actually needs `nvcc`, so it's compiled in an `nvidia/cuda:...-devel`
+   *builder* stage and just the built wheel is copied into a final
+   `nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04` stage — dropping the full
+   CUDA devel toolkit (headers, static libs, nvcc itself) from the shipped
+   image. Also bumped `torch`/`torchvision`/`torchaudio` to `2.7.1`/`0.22.1`/
+   `2.7.1` (the newest versions that still publish a `cu118` wheel —
+   `download.pytorch.org/whl/cu118` goes up to `2.7.1`), which also lifted
+   the old `transformers<4.50` pin (only needed because torch was `<2.5`).
+   Verified pixel-identical output and matching speed/RAM/VRAM vs. the old
+   31.4GB image on the same test clip.
+   - **A `pytorch/pytorch:*-runtime` (conda-based) image was tried first and
+     rejected** — even pinning it to the exact same `torch==2.1.2` this fork
+     used to install via pip, it was still ~16-19% slower on identical
+     inference work (measured after ruling out host memory pressure as a
+     confound — see below). The conda environment itself, not the torch
+     version, was the cause. A plain `nvidia/cuda-runtime` base (no conda) at
+     the same size class doesn't have this penalty.
+   - **That base also ships an old bundled ffmpeg (`4.3`, no NVENC `-rc`
+     support) earlier in `PATH` than a custom install** — silently broke the
+     final audio mux (`subprocess.call`'s return code isn't checked, so the
+     pipeline reported "DONE" even though the muxed `-audio.mp4` was never
+     actually created). Not an issue for the final `nvidia/cuda-runtime`
+     base (no conda ffmpeg to conflict with), but worth remembering if a
+     conda-based base is ever revisited.
+   - **Host machine RAM being nearly exhausted (from accumulated Docker
+     Desktop/WSL2 overhead across many pulls/builds in one session) measurably
+     inflated timing results** — a "26% slower" reading dropped to "~19%
+     slower" just from restarting Docker Desktop before re-measuring under
+     otherwise identical conditions. Any suspicious timing regression found
+     mid-session should be re-checked after confirming host RAM isn't
+     pegged, before trusting it as real.
+   - **The WSL2 vhdx-doesn't-shrink gotcha (see Environment gotchas below)
+     got hit hard and repeatedly during this exploration** — `docker system
+     df` reporting large "reclaimable" totals does not mean the host disk
+     reflects it; `docker builder prune -af` in particular had accumulated
+     31GB+ of unpruned BuildKit cache across several back-to-back multi-stage
+     builds before being caught. Prune build cache explicitly and often when
+     iterating on multi-stage Dockerfiles, not just images.
+
+6. **The multi-stage builder from point 5 turned out to be unnecessary —
+   `pycuda` is entirely unused dead weight.** A repo-wide grep finds zero
+   imports of it anywhere (`requirements.txt` lists it, but nothing in
+   `src/` or `run.py`/`api.py` actually imports it — TensorRT execution goes
+   through the `tensorrt` Python API's own context/buffer handling, not
+   `pycuda`). Since `pycuda`'s C-extension compile was the *only* reason the
+   image needed `nvcc`/the `-devel` builder stage, dropping it collapses
+   `Dockerfile.slim` back to a single `nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04`
+   stage. Also audited the actual `run.py` (human, `predict_type: trt`,
+   lip-only) import chain file-by-file and dropped everything not on it:
+   `torchvision` (only pulled in by the animal/`XPose` path's lazy import),
+   `torchaudio`/`gradio`/`huggingface_hub`/`transformers`/`pykalman`/
+   `soundfile` (all JoyVASA/gradio-pipeline-only, never imported by `run.py`),
+   and the `uvicorn`/`fastapi`/`pydantic` added briefly for `api.py`
+   compatibility (`api.py` is a separate long-running server, not part of
+   the CI's one-shot CLI use case). `mediapipe` still has to stay even
+   though the CI config never selects it — `src/models/__init__.py` imports
+   `MediaPipeFaceModel` unconditionally at module load time. Net result:
+   23.1GB (barely smaller than the 23.7GB multi-stage version — the base
+   image dominates size more than these packages did — but meaningfully
+   simpler and more correct as a dependency list). Two real omissions caught
+   only by actually running `run.py` end-to-end (none of this session's
+   other testing ever exercised `run.py` or `api.py` directly, only
+   `GradioLivePortraitPipeline` via ad hoc test scripts): `colorama` (used by
+   `run.py` itself) and `omegaconf`/`tqdm`/`Pillow` (missed in the first
+   from-scratch rewrite pass, caught by a systematic file-by-file import
+   audit before the second rebuild rather than another blind rebuild-retest
+   cycle).
 
 `Dockerfile.nvenc` (the earlier, `shaoguo`-based attempt) is kept for
 reference/fallback but superseded by `Dockerfile.slim`.
@@ -203,14 +289,30 @@ reasons as the primary Wav2Lip use case.
   thin-provisioned and grows automatically but does **not** shrink back when
   Docker reports images/cache freed internally — `docker system df` numbers
   freed don't reflect on the actual Windows host disk until the vhdx is
-  compacted separately. Ran the host disk down to single-digit GB free twice
-  this session between large builds/pulls; check `df -h /` before any
-  build/pull, not just `docker system df`.
+  compacted separately. Ran the host disk down to single-digit GB free
+  several times this session between large builds/pulls; check `df -h /`
+  before any build/pull, not just `docker system df`.
+  - **Hit true zero free disk once** (from a multi-stage build failing
+    mid-install after several back-to-back builds/pulls without pruning in
+    between) — at 0 bytes free, even basic commands (`ls`, `du | head`)
+    failed with write errors, since apparently even stdout buffering needs
+    disk headroom in this environment. Recovery: `docker builder prune -af`
+    (build cache had silently grown to 30GB+ unpruned) plus clearing this
+    project's own `tmp/` test-output accumulation reclaimed *some* space,
+    but real host free space stayed near-zero afterward regardless —
+    consistent with Windows' page/swap file having grown into the same
+    disk-full condition and not releasing until the underlying memory
+    pressure eased (no reboot needed this time; it recovered gradually on
+    its own over the following ~15-20 minutes as Docker Desktop settled).
+    **Lesson: prune build cache (`docker builder prune -af`), not just
+    images, proactively between iterative multi-stage-Dockerfile rebuilds —
+    don't wait until disk is critically low to check.**
 - **NVENC needs `NVIDIA_DRIVER_CAPABILITIES` to include `video`** — `--gpus
   all` alone only grants `compute,utility`. Without it, `h264_nvenc` fails to
   load `libnvidia-encode.so.1`.
-- **NVDEC (`h264_cuvid` etc.) confirmed available** in the BtbN ffmpeg build
-  used here — not yet wired into the actual decode path (see above).
+- **NVDEC implemented (`src/utils/nvdec_capture.py`), disabled by default** —
+  see "Not yet done" above for why (measured 4x slower than CPU decode due
+  to GPU decoder/inference contention, not decode speed itself).
 - A bleeding-edge host driver (610.74 at time of writing) means the
   *distro-packaged* ffmpeg (built years ago against an old NVENC API) fails
   with `Cannot get the preset configuration: unsupported param` — a current
