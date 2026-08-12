@@ -28,19 +28,47 @@ Known-good settings (matching the real CI's `inference.py` flags):
 `--flag-normalize-lip --animation-region lip --driving-multiplier 1.2`.
 See `configs/trt_infer_lip_ci.yaml`.
 
-**`run.py`'s CLI is now drop-in compatible with that CI invocation shape**
-(it wasn't originally — this fork's CLI used `--src_image`/`--dri_video`/
-`--cfg <yaml>` with no direct equivalent of the non-Faster fork's
-`-s`/`-d`/`-o` + per-flag overrides). Added `-s`/`-d` as short aliases,
-`-o`/`--output_dir` to write to a fixed directory instead of an
-auto-timestamped `./results/...` one, and `--flag-normalize-lip`/
-`--animation-region`/`--driving-multiplier` as CLI overrides on top of
-`--cfg` (only applied if actually passed). `--video-chunk-size` is accepted
-and ignored (documented no-op) since this fork streams frames instead of
-chunking. Verified end-to-end:
-`python run.py -s <portrait> -d <driving> -o <dir> --cfg configs/trt_infer_lip_ci.yaml --flag-normalize-lip --animation-region lip --driving-multiplier 1.2 --video-chunk-size 512`
-works exactly like the old `inference.py` call, just swapping the image and
-script name — so migrating that CI job is a one-line change, not a rewrite.
+**Added `inference.py`, a dedicated CI/production entrypoint matching the
+non-Faster fork's `inference.py` CLI *and output* contract exactly** —
+`run.py` was made CLI-compatible first (`-s`/`-d`/`-o` short flags,
+`--flag-normalize-lip`/`--animation-region`/`--driving-multiplier` as
+`--cfg` overrides, `--video-chunk-size` accepted as a documented no-op since
+this fork streams instead of chunking), but its *output* still differs
+fundamentally: `run.py` always writes `crop.mp4`/`org.mp4` plus `-audio`
+variants plus a `.pkl` motion template (4-5 files) for its own local-dev/
+debug purposes, whereas the non-Faster fork's CI always gets exactly one
+compressed file. Giving `run.py` the name `inference.py` (e.g. via a
+symlink) would have implied a byte-for-byte drop-in swap that wasn't
+actually true and the CI script would still have needed fixing (its
+`mv temp/*.mp4 "$a"` breaks with multiple matches) — so `inference.py` is a
+separate, narrower script instead: human/video-source/TensorRT-only, single
+output file, `-b:v 1M -c:a copy` baked in (matching the non-Faster fork's
+own downstream compress step exactly, verified their driving video's audio
+is already AAC/48kHz/mono by the time it reaches this stage — a prior
+pipeline stage re-encodes it to that format, making `-c:a copy` safe). CI
+migration is now genuinely a one-line `image:` swap plus the script name
+(`inference.py` stays the same) and one added `--cfg` flag pointing at
+`configs/trt_infer_lip_ci.yaml` (or rely on this image's own
+`FLP_DEFAULT_CFG` env default and omit `--cfg` entirely). `run.py` remains
+the local-dev/debug entrypoint (side-by-side crop comparison, animal model,
+still images, pickled driving templates, realtime webcam mode) — use that,
+not `inference.py`, for anything other than the CI path.
+
+Two real, pre-existing bugs surfaced while first testing `run.py`/`api.py`'s
+`run_with_video`/`run_with_pkl` directly this session — this was the first
+time either was actually exercised end-to-end all session (everything
+before used `GradioLivePortraitPipeline` via ad hoc scripts instead), so
+neither bug was ever a regression from that session's other work:
+- Both always indexed `pipe.src_imgs[0]`/`pipe.src_infos[0]` regardless of
+  driving frame index, so a video source's own head motion never advanced
+  past frame 0 — fixed to index by `frame_ind` when `pipe.is_source_video`.
+- `run.py` unconditionally did `infer_cfg.infer_params.flag_pasteback =
+  args.paste_back`, and `--paste_back` defaults to `False` — so any
+  invocation without `--paste_back` silently disabled paste-back regardless
+  of the `--cfg` file's own `flag_pasteback: True` setting, making the
+  entire output just the raw, unmodified source video. Fixed to only
+  override when `--paste_back` is explicitly passed (same pattern as the
+  other CLI overrides).
 
 JoyVASA (audio-driven, no separate lip-sync step) was tried as an alternative
 to the Wav2Lip+FasterLivePortrait combo — **re-tested this session after the

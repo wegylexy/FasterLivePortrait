@@ -57,7 +57,15 @@ RUN pip install --no-cache-dir \
     && pip install --no-cache-dir onnxruntime-gpu==1.17.0 \
     && pip install --no-cache-dir "numpy==1.26.4"
 
-WORKDIR /root/FasterLivePortrait
-COPY . /root/FasterLivePortrait
+WORKDIR /workspace
+COPY . /workspace
+
+# FLP_DEFAULT_CFG only changes run.py's --cfg default inside THIS image, not
+# the repo's own general-purpose default (configs/onnx_infer.yaml) when
+# run.py is invoked directly from a checkout instead of this container.
+# inference.py (a genuinely separate script, not an alias for run.py - see
+# its own docstring) is the CI/production entrypoint matching the non-Faster
+# fork's CLI and single-file output contract exactly.
+ENV FLP_DEFAULT_CFG=configs/trt_infer_lip_ci.yaml
 
 CMD ["bash"]

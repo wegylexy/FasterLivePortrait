@@ -332,7 +332,9 @@ if __name__ == '__main__':
                         help='driving video')
     parser.add_argument('-o', '--output_dir', required=False, type=str, default=None,
                         help='output directory (default: auto-timestamped under ./results)')
-    parser.add_argument('--cfg', required=False, type=str, default="configs/onnx_infer.yaml", help='inference config')
+    parser.add_argument('--cfg', required=False, type=str,
+                        default=os.environ.get("FLP_DEFAULT_CFG", "configs/onnx_infer.yaml"),
+                        help='inference config')
     parser.add_argument('--realtime', action='store_true', help='realtime inference')
     parser.add_argument('--animal', action='store_true', help='use animal model')
     parser.add_argument('--paste_back', action='store_true', default=None,
