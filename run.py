@@ -90,7 +90,8 @@ def run_with_video(args):
             break
         t0 = time.time()
         first_frame = frame_ind == 0
-        dri_crop, out_crop, out_org, dri_motion_info = pipe.run(frame, pipe.src_imgs[0], pipe.src_infos[0],
+        src_idx = frame_ind if pipe.is_source_video else 0
+        dri_crop, out_crop, out_org, dri_motion_info = pipe.run(frame, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
                                                                 first_frame=first_frame)
         frame_ind += 1
         if out_crop is None:
@@ -205,7 +206,8 @@ def run_with_pkl(args):
         t0 = time.time()
         first_frame = frame_ind == 0
         dri_motion_info_ = [motion_lst[frame_ind], c_eyes_lst[frame_ind], c_lip_lst[frame_ind]]
-        out_crop, out_org = pipe.run_with_pkl(dri_motion_info_, pipe.src_imgs[0], pipe.src_infos[0],
+        src_idx = frame_ind if pipe.is_source_video else 0
+        out_crop, out_org = pipe.run_with_pkl(dri_motion_info_, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
                                               first_frame=first_frame)
         if out_crop is None:
             print(f"no face in driving frame:{frame_ind}")
