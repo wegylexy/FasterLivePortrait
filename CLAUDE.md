@@ -46,13 +46,16 @@ output file, `-b:v 1M -c:a copy` baked in (matching the non-Faster fork's
 own downstream compress step exactly, verified their driving video's audio
 is already AAC/48kHz/mono by the time it reaches this stage — a prior
 pipeline stage re-encodes it to that format, making `-c:a copy` safe). CI
-migration is now genuinely a one-line `image:` swap plus the script name
-(`inference.py` stays the same) and one added `--cfg` flag pointing at
+migration is a one-line `image:` swap plus the script name (`inference.py`
+stays the same) and one added `--cfg` flag pointing at
 `configs/trt_infer_lip_ci.yaml` (or rely on this image's own
-`FLP_DEFAULT_CFG` env default and omit `--cfg` entirely). `run.py` remains
-the local-dev/debug entrypoint (side-by-side crop comparison, animal model,
-still images, pickled driving templates, realtime webcam mode) — use that,
-not `inference.py`, for anything other than the CI path.
+`FLP_DEFAULT_CFG` env default and omit `--cfg` entirely) — **this claim was
+initially wrong** (see "Fixed this session" #7 below: checkpoints weren't
+actually baked into the image until that point, so the "one-line swap" only
+became true after that fix landed). `run.py` remains the local-dev/debug
+entrypoint (side-by-side crop comparison, animal model, still images,
+pickled driving templates, realtime webcam mode) — use that, not
+`inference.py`, for anything other than the CI path.
 
 Two real, pre-existing bugs surfaced while first testing `run.py`/`api.py`'s
 `run_with_video`/`run_with_pkl` directly this session — this was the first
@@ -249,6 +252,94 @@ use case.
 
 `Dockerfile.nvenc` (the earlier, `shaoguo`-based attempt) is kept for
 reference/fallback but superseded by `Dockerfile.slim`.
+
+7. **Checkpoints were never actually baked into `Dockerfile.slim`, in any
+   prior session — confirmed by grepping the Dockerfile (no `checkpoint`
+   reference at all) and finding `checkpoints` explicitly listed in
+   `.dockerignore`.** This was caught only because the user re-ran the real
+   GitLab CI job after the cwd fix (#6 above / "Environment gotchas") and
+   hit a second failure: `libgrid_sample_3d_plugin.so` (and every other
+   `./checkpoints/...` path) not found, since `os.chdir(REPO_ROOT)` now
+   correctly pointed at `/workspace`, but `/workspace/checkpoints` never
+   existed in the image. All prior local testing of this image almost
+   certainly relied on a bind-mount (`-v .../checkpoints:/workspace/checkpoints`
+   — consistent with the Windows/git-bash `-v` path-mangling gotcha already
+   documented below), which isn't something a CI job's `image:` gets for
+   free. The earlier "CI migration is a one-line `image:` swap" claim above
+   was wrong until this was fixed.
+   - Fixed by actually building the TensorRT engines: downloaded the
+     human/lip-path ONNX subset (`appearance_feature_extractor`,
+     `face_2dpose_106_static`, `landmark`, `motion_extractor`,
+     `retinaface_det_static`, `stitching`, `stitching_eye`, `stitching_lip`,
+     `warping_spade-fix`) plus the precompiled `libgrid_sample_3d_plugin.so`
+     from `huggingface.co/warmshao/FasterLivePortrait` (confirmed the plugin
+     really does ship precompiled there, matching the earlier claim in
+     "Actual use case" above), then ran `scripts/all_onnx2trt.sh` inside a
+     container built from `Dockerfile.slim` itself with `--gpus all` (so the
+     engines are built with the exact same `tensorrt==8.6.1` that will later
+     load them) — 9 `.trt` files, ~418MB total, fp16 except
+     `motion_extractor` at fp32 per the script.
+   - **First attempt (Git LFS) failed at push time, not at conversion —
+     worth remembering for any future large-binary-in-repo decision**:
+     committed the `.trt` files + plugin `.so` via Git LFS (`.gitattributes`,
+     `.gitignore`/`.dockerignore` changed from a blanket `checkpoints`
+     exclusion to `checkpoints/*` plus explicit negations for the needed
+     files), but `git push` failed outright: `batch response: @wegylexy can
+     not upload new objects to public fork wegylexy/FasterLivePortrait`.
+     **GitHub blocks pushing new Git LFS objects into forks entirely**,
+     regardless of plan/quota, since LFS storage bills against the upstream
+     repo owner rather than the fork — this is a hard restriction, not a
+     cost one, confirmed only by actually attempting the push (this wasn't
+     predictable by inspecting the repo beforehand). Reverted the LFS setup
+     (`.gitattributes` removed, `.gitignore`/`.dockerignore` reverted to
+     the original blanket `checkpoints` exclusion) rather than keep dead
+     LFS config around.
+   - **Actual fix: published the 10 files as a tarball GitHub Release
+     asset** (`gh release create checkpoints-liveportrait-onnx-trt-v1`,
+     ~374MB compressed, sha256 `26f6237fd3735ff9f072e0120c1370d7a96e5e6698d7dd1d1e68c918a0f7c8ad`)
+     instead — Release assets aren't Git LFS and aren't subject to the
+     fork restriction, free, 2GB/file limit. `Dockerfile.slim` adds a `RUN
+     wget ... && sha256sum -c ... && tar -xzf ...` step (after `COPY .
+     /workspace`) that downloads and verifies the tarball into
+     `checkpoints/liveportrait_onnx/` at build time. No GPU needed for that
+     step, so it works fine on GitHub Actions' `ubuntu-latest` runner too.
+   - **Considered and rejected**: a GitLab Runner `config.toml` `volumes`
+     mount (host-side, not a pipeline-YAML change, so it would have
+     satisfied "don't touch my pipeline" too) — rejected because it's
+     runner-wide (applies to every job on that runner across all
+     projects/pipelines, not just this one) and makes the image
+     non-standalone if that runner config ever changes; the Release-asset
+     approach keeps the image self-sufficient regardless of runner setup.
+   - **Engine portability caveat**: TensorRT engines are tied to the
+     GPU/driver they're built on, unlike ONNX. Built here on an RTX 4070
+     (driver 610.74); the user confirmed the actual GitLab runner is an RTX
+     4090 with the latest Studio driver — both Ada Lovelace (compute
+     capability 8.9), so expected to be compatible, but if a future runner
+     ever moves to a different GPU generation, the released tarball would
+     need rebuilding for that hardware and re-uploading under a new release
+     tag, not just re-downloading.
+   - **Verified end-to-end twice before declaring this done** (after wrongly
+     declaring the cwd fix alone "done" earlier the same session): once
+     against the Git-LFS-staged local checkpoints before discovering the
+     fork-push block, and again against the final Release-asset-based image
+     built from a completely clean context (43KB build context — confirmed
+     nothing local leaked in). Both times: built the image, ran a container
+     with *no volume mounts at all* and `-w /builds/ai/edu/bible` (the exact
+     path from the user's traceback) to genuinely reproduce the GitLab CI
+     cwd override, using real sample assets (`assets/examples/source/s0.jpg`
+     + `assets/examples/driving/d0.mp4`). Produced an identical real
+     151KB/3.12s output video both times, confirming the cwd fix and the
+     baked-in checkpoints work together standalone.
+   - **`docker-publish.yml` (GitHub Actions) still can't build these
+     engines itself** — it runs on a plain `ubuntu-latest` runner with no
+     GPU, so it was never going to be able to do the ONNX→TensorRT
+     conversion regardless of this fix. That's the whole reason the engines
+     are pre-built and fetched via `wget`/`RUN` rather than generated by a
+     Dockerfile step — no GPU required for a download+extract. Also worth
+     watching: that workflow already had a comment flagging the ~23GB image
+     as marginal against the runner's ~14–26GB disk budget *before* this
+     change added another ~420MB — hasn't been confirmed to still fit, only
+     that the logic is correct.
 
 ## Not yet done
 

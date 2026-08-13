@@ -60,6 +60,24 @@ RUN pip install --no-cache-dir \
 WORKDIR /workspace
 COPY . /workspace
 
+# Prebuilt TensorRT 8.6.1 engines + precompiled libgrid_sample_3d_plugin.so
+# for the human/lip-only inference.py CI path - GPU/driver-specific
+# artifacts that can't be built in this stage (no GPU access during
+# `docker build`), so they're fetched from a GitHub Release rather than
+# committed to git: this repo is a fork, and GitHub outright blocks pushing
+# new Git LFS objects into forks ("can not upload new objects to public
+# fork"), tried first and hit that wall. Built once on an RTX 4070 (Ada,
+# compute capability 8.9) against this same tensorrt==8.6.1 - rebuild and
+# re-upload under a new release tag if the target GPU generation ever
+# changes. This makes the image standalone: no volume mount or download
+# step needed at container runtime, since CI job images can't rely on
+# either.
+RUN mkdir -p checkpoints/liveportrait_onnx && \
+    wget -q https://github.com/wegylexy/FasterLivePortrait/releases/download/checkpoints-liveportrait-onnx-trt-v1/liveportrait_onnx_trt.tar.gz -O /tmp/ckpt.tar.gz && \
+    echo "26f6237fd3735ff9f072e0120c1370d7a96e5e6698d7dd1d1e68c918a0f7c8ad  /tmp/ckpt.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/ckpt.tar.gz -C checkpoints/liveportrait_onnx && \
+    rm /tmp/ckpt.tar.gz
+
 # FLP_DEFAULT_CFG only changes run.py's --cfg default inside THIS image, not
 # the repo's own general-purpose default (configs/onnx_infer.yaml) when
 # run.py is invoked directly from a checkout instead of this container.
