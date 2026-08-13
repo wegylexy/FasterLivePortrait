@@ -32,7 +32,15 @@ if platform.system().lower() == 'windows':
 else:
     FFMPEG = "ffmpeg"
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CFG = os.environ.get("FLP_DEFAULT_CFG", "configs/trt_infer_lip_ci.yaml")
+if not os.path.isabs(DEFAULT_CFG):
+    # Resolve relative to this script's location, not the process cwd - CI
+    # runners (e.g. GitLab CI using this image as a job `image:`) override
+    # the container's cwd to their own checkout path instead of honoring
+    # the image's WORKDIR, so a plain relative path resolves against the
+    # wrong directory.
+    DEFAULT_CFG = os.path.join(REPO_ROOT, DEFAULT_CFG)
 
 
 def main(args):
@@ -109,4 +117,16 @@ if __name__ == '__main__':
                         help='no-op here - this fork streams frames instead of chunking, kept only for '
                              'drop-in CLI compatibility with the non-Faster fork')
     args, unknown = parser.parse_known_args()
+    # Resolve user-supplied paths against the invoking cwd *before* chdir'ing
+    # below - CI runners (e.g. GitLab CI using this image as a job `image:`)
+    # override the container's cwd to their own checkout path instead of
+    # honoring the image's WORKDIR, and every relative path baked into the
+    # shipped config (checkpoint .trt files, mask_crop_path, DEFAULT_CFG
+    # itself) assumes cwd == repo root. Making src/dri/output absolute here
+    # first lets us safely chdir to REPO_ROOT for everything else below.
+    args.src_image = os.path.abspath(args.src_image)
+    args.dri_video = os.path.abspath(args.dri_video)
+    if args.output_dir:
+        args.output_dir = os.path.abspath(args.output_dir)
+    os.chdir(REPO_ROOT)
     main(args)

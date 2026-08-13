@@ -313,6 +313,25 @@ reasons as the primary Wav2Lip use case.
 
 ## Environment gotchas
 
+- **GitLab CI overrides the job image's `WORKDIR`/cwd to its own checkout
+  path** (`/builds/<namespace>/<project>`) when this image is used as a job
+  `image:` — confirmed by the user, who runs `inference.py` this way. Broke
+  `inference.py`'s `DEFAULT_CFG` (`configs/trt_infer_lip_ci.yaml`, a plain
+  relative path resolved against cwd instead of `/workspace`) and would have
+  broken the checkpoint loading right after it too, since
+  `trt_infer_lip_ci.yaml`'s own `model_path`/`mask_crop_path` entries are
+  *also* plain `./checkpoints/...`-style relative paths resolved against cwd
+  wherever they're opened (`src/models/predictor.py`'s
+  `os.path.exists(model_path)`/`InferenceSession(model_path, ...)`), not
+  against the config file's own location. Fixed in `inference.py` by
+  resolving `-s`/`-d`/`-o` to absolute paths *first* (so they still work
+  relative to whatever cwd the CI job actually invokes from) and only then
+  `os.chdir()`-ing to the script's own directory (`REPO_ROOT`) before loading
+  the config — so every relative path baked into the shipped config resolves
+  against the image's bundled `/workspace`, regardless of what cwd the CI
+  runner set. `run.py` (local-dev entrypoint) doesn't need this since it's
+  always invoked from within the checked-out repo, where cwd already equals
+  repo root.
 - **Docker Desktop / WSL2 disk**: the WSL2 virtual disk (`.vhdx`) is
   thin-provisioned and grows automatically but does **not** shrink back when
   Docker reports images/cache freed internally — `docker system df` numbers
