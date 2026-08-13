@@ -47,7 +47,8 @@ else:
 def run_with_video(args):
     print(Fore.RED+'Render,  Q > exit,  S > Stitching,  Z > RelativeMotion,  X > AnimationRegion,  C > CropDrivingVideo, KL > AdjustSourceScale, NM > AdjustDriverScale,  Space > Webcamassource,  R > SwitchRealtimeWebcamUpdate'+Style.RESET_ALL)
     infer_cfg = OmegaConf.load(args.cfg)
-    infer_cfg.infer_params.flag_pasteback = args.paste_back
+    if args.paste_back is not None:
+        infer_cfg.infer_params.flag_pasteback = args.paste_back
 
     pipe = FasterLivePortraitPipeline(cfg=infer_cfg, is_animal=args.animal)
     ret = pipe.prepare_source(args.src_image, realtime=args.realtime)
@@ -167,7 +168,8 @@ def run_with_video(args):
 
 def run_with_pkl(args):
     infer_cfg = OmegaConf.load(args.cfg)
-    infer_cfg.infer_params.flag_pasteback = args.paste_back
+    if args.paste_back is not None:
+        infer_cfg.infer_params.flag_pasteback = args.paste_back
 
     pipe = FasterLivePortraitPipeline(cfg=infer_cfg, is_animal=args.animal)
     ret = pipe.prepare_source(args.src_image, realtime=args.realtime)
@@ -313,7 +315,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg', required=False, type=str, default="configs/onnx_infer.yaml", help='inference config')
     parser.add_argument('--realtime', action='store_true', help='realtime inference')
     parser.add_argument('--animal', action='store_true', help='use animal model')
-    parser.add_argument('--paste_back', action='store_true', default=False, help='paste back to origin image')
+    parser.add_argument('--paste_back', action='store_true', default=None, help='paste back to origin image')
     args, unknown = parser.parse_known_args()
 
     if args.dri_video.endswith(".pkl"):
