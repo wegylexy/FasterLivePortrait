@@ -48,11 +48,18 @@ def main(args):
     infer_cfg.infer_params.flag_pasteback = True
     apply_cli_overrides(infer_cfg, args)
 
+    print("loading pipeline / TensorRT engines...", flush=True)
+    t0 = time.time()
     pipe = FasterLivePortraitPipeline(cfg=infer_cfg, is_animal=False)
+    print(f"pipeline loaded in {time.time() - t0:.1f}s", flush=True)
+
+    print(f"preparing source: {args.src_image}", flush=True)
+    t0 = time.time()
     ret = pipe.prepare_source(args.src_image, realtime=False)
     if not ret:
-        print(f"no face in {args.src_image}! exit!")
+        print(f"no face in {args.src_image}! exit!", flush=True)
         exit(1)
+    print(f"source ready in {time.time() - t0:.1f}s", flush=True)
 
     use_nvdec = getattr(infer_cfg.infer_params, "flag_use_nvdec", False)
     vcap = open_video_capture(args.dri_video, use_nvdec=use_nvdec)
@@ -65,8 +72,17 @@ def main(args):
                               f"{os.path.basename(args.src_image)}-{os.path.basename(args.dri_video)}.mp4")
     vout = cv2.VideoWriter(vsave_path, fourcc, fps, (w, h))
 
+    total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
     infer_times = []
     frame_ind = 0
+    start_t = time.time()
+    last_log_t = start_t
+    # CI log collectors (e.g. GitLab) treat a long silent stdout gap as a
+    # stalled job and kill it, and Python fully block-buffers stdout when
+    # it isn't a tty - print+flush a heartbeat every 30s so progress is
+    # visible regardless of per-frame speed or clip length, without
+    # spamming the log on long runs (e.g. ~60 lines for a 30-minute job).
+    HEARTBEAT_SECS = 30
     while vcap.isOpened():
         ret, frame = vcap.read()
         if not ret:
@@ -78,28 +94,45 @@ def main(args):
                                     first_frame=first_frame)
         frame_ind += 1
         if out_org is None:
-            print(f"no face in driving frame:{frame_ind}")
+            print(f"no face in driving frame:{frame_ind}", flush=True)
             continue
         infer_times.append(time.time() - t0)
         out_org = cv2.cvtColor(out_org, cv2.COLOR_RGB2BGR)
         vout.write(out_org)
+        now = time.time()
+        if now - last_log_t >= HEARTBEAT_SECS:
+            avg_ms = (now - start_t) / frame_ind * 1000
+            print(f"progress: frame {frame_ind}/{total_frames or '?'} "
+                  f"({now - start_t:.1f}s elapsed, {avg_ms:.0f} ms/frame avg)", flush=True)
+            last_log_t = now
     vcap.release()
     vout.release()
+    print(f"render done: {frame_ind} frames in {time.time() - start_t:.1f}s", flush=True)
 
     # -b:v 1M, -c:a copy: matches the non-Faster fork's own CLI output
     # contract exactly (fixed bitrate, audio copied not re-encoded) - the
     # downstream pipeline needs no separate re-compression step.
+    # -rc cbr must be explicit here: h264_nvenc with -b:v but no explicit
+    # -rc mode hangs indefinitely instead of erroring on this ffmpeg/driver
+    # combo (same underlying issue as the -cq deadlock noted in CLAUDE.md /
+    # NVENC_ARGS elsewhere - any -b:v/-maxrate without an explicit -rc mode
+    # is unsafe here, not just the -cq combination).
     vsave_final = os.path.splitext(vsave_path)[0] + "-final.mp4"
     mux_args = [FFMPEG, "-i", vsave_path]
     if video_has_audio(args.dri_video):
         mux_args += ["-i", args.dri_video, "-map", "0:v", "-map", "1:a", "-c:a", "copy", "-shortest"]
-    mux_args += ["-b:v", "1M", "-c:v", "h264_nvenc", vsave_final, "-y"]
-    subprocess.call(mux_args)
+    mux_args += ["-c:v", "h264_nvenc", "-rc", "cbr", "-b:v", "1M", vsave_final, "-y"]
+    print(f"muxing: {' '.join(mux_args)}", flush=True)
+    mux_t0 = time.time()
+    ret = subprocess.call(mux_args)
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg mux failed with exit code {ret}: {' '.join(mux_args)}")
+    print(f"mux done in {time.time() - mux_t0:.1f}s", flush=True)
     os.remove(vsave_path)
-    print(vsave_final)
+    print(vsave_final, flush=True)
     print("inference median time: {} ms/frame, mean time: {} ms/frame".format(
         np.median(infer_times) * 1000 if infer_times else 0,
-        np.mean(infer_times) * 1000 if infer_times else 0))
+        np.mean(infer_times) * 1000 if infer_times else 0), flush=True)
 
 
 if __name__ == '__main__':
