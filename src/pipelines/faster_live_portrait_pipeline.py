@@ -9,7 +9,6 @@ import os.path
 import pdb
 import time
 import traceback
-from PIL import Image
 import cv2
 from tqdm import tqdm
 import numpy as np
@@ -249,6 +248,7 @@ class FasterLivePortraitPipeline:
         src_faces = []
         if self.is_animal:
             with torch.no_grad():
+                from PIL import Image  # animal path only; kept out of the slim CI image
                 img_rgb_pil = Image.fromarray(img_rgb)
                 lmk = self.model_dict["xpose"].run(
                     img_rgb_pil,

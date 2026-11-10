@@ -6,13 +6,25 @@
 import pdb
 
 import numpy as np
-from insightface.app.common import Face
 import cv2
 from .predictor import get_predictor
 from ..utils import face_align
 import torch
 from torch.cuda import nvtx
 from .predictor import numpy_to_torch_dtype_dict
+
+
+class Face(dict):
+    """insightface.app.common.Face: a dict with attribute access (missing keys read as None)."""
+
+    def __init__(self, d=None, **kwargs):
+        super().__init__(d or {}, **kwargs)
+
+    def __getattr__(self, name):
+        return self.get(name)
+
+    def __setattr__(self, name, value):
+        self[name] = value
 
 
 def sort_by_direction(faces, direction: str = 'large-small', face_center=None):

@@ -4,7 +4,6 @@ import os
 import time
 
 import numpy as np
-import onnxruntime
 
 import torch
 from torch.cuda import nvtx
@@ -183,6 +182,7 @@ class OnnxRuntimePredictor:
         providers = ['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']
 
         print(f"OnnxRuntime use {providers}")
+        import onnxruntime  # ONNX predictor only; kept out of the TensorRT-only CI image
         opts = onnxruntime.SessionOptions()
         # opts.inter_op_num_threads = kwargs.get("num_threads", 4)
         # opts.intra_op_num_threads = kwargs.get("num_threads", 4)

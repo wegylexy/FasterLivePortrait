@@ -1,61 +1,90 @@
-# Leanest image for the actual CI use case: run.py's human/lip-only,
-# TensorRT-only (predict_type: trt) video-driving path. No multi-stage
-# builder needed - pycuda (the only thing that needed nvcc) turned out to
-# be entirely unused dead weight (grep across the whole repo finds zero
-# imports of it; TensorRT execution goes through the tensorrt Python API's
-# own context/buffer handling, not pycuda). torchvision/torchaudio are also
-# dropped: torchvision is only pulled in by the animal (XPose) path's lazy
-# import, torchaudio only by JoyVASA/the gradio pipeline - neither is ever
-# imported by run.py's actual call chain (FasterLivePortraitPipeline).
-# Similarly gradio/huggingface_hub/transformers/pykalman/soundfile are
-# JoyVASA/gradio-pipeline-only and dropped. mediapipe stays required even
-# though our config never selects it - src/models/__init__.py imports it
-# unconditionally at module load time.
+# Leanest image for the actual CI use case: inference.py's human/lip-only,
+# TensorRT-only (predict_type: trt) video-driving path.
+#
+# One CUDA 12 stack, all from NVIDIA: the official nvidia/cuda base, NVIDIA's
+# tensorrt wheels and the nvidia-*-cu12 runtime wheels torch depends on.
+# (The previous image carried three: the base's system CUDA 11.8 + cuDNN 8,
+# torch cu118's own CUDA 11 wheels, and the CUDA 12 wheels tensorrt==8.6.1
+# already pulled in.)
+#
+# Version ceilings:
+# - TensorRT stays on 8.6.1, the last 8.x: the prebuilt engines and the
+#   precompiled grid_sample plugin (links libnvinfer.so.8) are tied to it.
+#   TensorRT 10 would mean recompiling the plugin and rebuilding every engine.
+# - tensorrt 8.6.1 only ships bindings up to Python 3.11, hence Ubuntu 22.04
+#   (Python 3.10) rather than 24.04.
+# - torch is the newest release built for CUDA 12 (cu126), so it shares
+#   tensorrt's CUDA 12 libraries instead of adding a CUDA 13 stack.
+#
+# Left out because the CI path never imports them (their imports are lazy):
+# onnxruntime/onnx (ONNX predictor), mediapipe (MediaPipeFaceModel),
+# insightface (only its Face dict class was used, now in face_analysis_model),
+# Pillow (animal path only; 13.x, which fixes its open CVEs, needs Python
+# 3.11+), triton (torch.compile only), torchvision/torchaudio, gradio,
+# JoyVASA deps.
 
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.3-base-ubuntu22.04
 
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip git wget xz-utils \
-        libgl1 libglib2.0-0 libsndfile1 \
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends python3 python3-pip xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.10 /usr/bin/python
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
 # modern static ffmpeg with both NVENC and NVDEC support (distro/pip ffmpeg
 # builds predate this driver's NVENC/NVDEC API and lack cuvid decoders)
-RUN wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -O /tmp/ffmpeg.tar.xz && \
+RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz', '/tmp/ffmpeg.tar.xz')" && \
     tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
     cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg && \
     cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe && \
     rm -rf /tmp/ffmpeg*
 
-RUN pip install --no-cache-dir \
-        torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-
-# mediapipe pulls in plain CPU-only onnxruntime as a transitive dep, which
-# shares onnxruntime-gpu's import namespace and silently wins if it installs
-# after onnxruntime-gpu. Uninstall it and reinstall the GPU build at the end
-# of this SAME layer (not a separate RUN) so the discarded CPU wheel's
-# bytes never get committed to a layer in the first place.
-RUN pip install --no-cache-dir \
-        tensorrt==8.6.1 \
-        onnx \
+# All in one layer, so packages uninstalled at the end never land in the image:
+# - tensorrt==8.6.1 on PyPI is an sdist shim (the `tensorrt` module re-exports
+#   tensorrt_bindings) whose build pip-installs NVIDIA's wheels and fails under
+#   current pip's build isolation. So the two wheels come straight from
+#   NVIDIA's index first and the shim is built without isolation or deps;
+#   --no-deps throughout because torch already brings the CUDA 12
+#   runtime/cuBLAS/cuDNN wheels they need.
+# - libnvinfer.so.8 hard-links libcudnn.so.8, but torch needs cuDNN 9 from the
+#   same pip package name (nvidia-cudnn-cu12). So NVIDIA's last cuDNN 8 wheel
+#   for CUDA 12 is unpacked beside it under different sonames, so the two
+#   can't clash. All of it: the engines use cuDNN tactics, and cuDNN 8 loads
+#   libcudnn_ops_train.so.8 for those even at inference.
+# - numpy stays 1.x: tensorrt 8.6.1's bindings are built against the 1.x ABI.
+# - triton is torch.compile-only; anything depending on torch (torchgeometry)
+#   makes pip reinstall it, hence removed last.
+# - setuptools/wheel/filelock come pinned old from PyTorch's index (CVE-flagged),
+#   so they're upgraded from PyPI last.
+# - scikit-image pulls Pillow/imageio for its io module, which face_align's
+#   skimage.transform doesn't use.
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126 \
+    && pip install --no-cache-dir --no-deps --index-url https://pypi.nvidia.com \
+        tensorrt-bindings==8.6.1 tensorrt-libs==8.6.1 \
+    && pip install --no-cache-dir setuptools wheel \
+    && pip install --no-cache-dir --no-deps --no-build-isolation tensorrt==8.6.1 \
+    && pip install --no-cache-dir \
         numpy==1.26.4 \
-        opencv-python \
+        opencv-python-headless \
         scikit-image \
-        insightface \
-        mediapipe \
         torchgeometry \
         ffmpeg-python \
         colorama \
         omegaconf \
         tqdm \
-        Pillow \
-    && pip uninstall -y onnxruntime \
-    && pip install --no-cache-dir onnxruntime-gpu==1.17.0 \
-    && pip install --no-cache-dir "numpy==1.26.4"
+    && pip download --no-cache-dir --no-deps -d /tmp/cudnn8 nvidia-cudnn-cu12==8.9.7.29 \
+    && python -m zipfile -e /tmp/cudnn8/*.whl /tmp/cudnn8/x \
+    && mkdir -p /usr/local/lib/cudnn8 \
+    && cp /tmp/cudnn8/x/nvidia/cudnn/lib/libcudnn*.so.8 /usr/local/lib/cudnn8/ \
+    && echo /usr/local/lib/cudnn8 > /etc/ld.so.conf.d/cudnn8.conf && ldconfig \
+    && rm -rf /tmp/cudnn8 \
+    && pip uninstall -y triton pillow imageio \
+    && pip install --no-cache-dir "numpy==1.26.4" \
+    && pip install --no-cache-dir --upgrade --index-url https://pypi.org/simple setuptools wheel filelock \
+    && python -c "import tensorrt; assert tensorrt.__version__ == '8.6.1', tensorrt.__version__"
 
 WORKDIR /workspace
 COPY . /workspace
@@ -73,7 +102,7 @@ COPY . /workspace
 # step needed at container runtime, since CI job images can't rely on
 # either.
 RUN mkdir -p checkpoints/liveportrait_onnx && \
-    wget -q https://github.com/wegylexy/FasterLivePortrait/releases/download/checkpoints-liveportrait-onnx-trt-v1/liveportrait_onnx_trt.tar.gz -O /tmp/ckpt.tar.gz && \
+    python -c "import urllib.request as u; u.urlretrieve('https://github.com/wegylexy/FasterLivePortrait/releases/download/checkpoints-liveportrait-onnx-trt-v1/liveportrait_onnx_trt.tar.gz', '/tmp/ckpt.tar.gz')" && \
     echo "26f6237fd3735ff9f072e0120c1370d7a96e5e6698d7dd1d1e68c918a0f7c8ad  /tmp/ckpt.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/ckpt.tar.gz -C checkpoints/liveportrait_onnx && \
     rm /tmp/ckpt.tar.gz
