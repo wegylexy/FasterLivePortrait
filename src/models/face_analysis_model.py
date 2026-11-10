@@ -318,8 +318,14 @@ class FaceAnalysisModel:
             self.estimate_face_pose(data[0], face)
             ret.append(face)
         ret = sort_by_direction(ret, 'large-small', None)
+        if kwargs.get("return_bboxes", False):
+            return [x.landmark for x in ret], [np.asarray(x.bbox, dtype=np.float32) for x in ret]
         outs = [x.landmark for x in ret]
         return outs
+
+    def predict_in_bbox(self, img, bbox):
+        """106-point landmarks for a face already known to be in bbox, skipping detection."""
+        return self.estimate_face_pose(img, Face(bbox=np.asarray(bbox, dtype=np.float32), kps=None, det_score=1.0))
 
     def __del__(self):
         del self.face_det

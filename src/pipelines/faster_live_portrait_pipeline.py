@@ -57,11 +57,12 @@ class _LazySourceFrames:
         if real_idx != self._read_cursor:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, real_idx)
             self._read_cursor = real_idx
+            self._pipeline._src_track = None  # not the next frame: tracking would follow a stale face box
         ret, frame = self._cap.read()
         self._read_cursor += 1
         if not ret:
             raise RuntimeError(f"failed to read source video frame {real_idx}")
-        processed = self._pipeline._process_source_frame(frame, **self._process_kwargs)
+        processed = self._pipeline._process_source_frame(frame, track=True, **self._process_kwargs)
         if processed is None:
             # no face in this frame - reuse the last good frame rather than
             # breaking the whole render (mirrors the old eager path's skip-on-miss)
@@ -196,6 +197,44 @@ class FasterLivePortraitPipeline:
         combined_lip_ratio_tensor = np.concatenate([c_s_lip, c_d_lip_i], axis=1)  # 1x2
         return combined_lip_ratio_tensor
 
+    TRACK_REDETECT_FRAMES = 48  # full detection at least every 2 s at 24 fps, so drift can't accumulate
+    TRACK_MAX_JUMP = 0.1  # of face size; a larger move or resize between frames forces a re-detect
+
+    @staticmethod
+    def _lmk_extent(lmk):
+        (x0, y0), (x1, y1) = lmk.min(0), lmk.max(0)
+        return np.array([(x0 + x1) / 2, (y0 + y1) / 2]), max(x1 - x0, y1 - y0)
+
+    def _track_source_face(self, img_bgr):
+        """
+        For consecutive frames of a source video: skip the full-frame face detector
+        (about a quarter of source preparation) and predict the face box from the
+        previous frame's 106 landmarks instead, using the box/landmark relation
+        measured at the last real detection. Returns None when a full detection is
+        due (first frame, periodically, after a jump, or not exactly one face), in
+        which case the caller detects and this re-anchors on the result.
+        """
+        fa = self.model_dict["face_analysis"]
+        t = getattr(self, "_src_track", None)
+        if t is not None and t["age"] < self.TRACK_REDETECT_FRAMES:
+            c, s = self._lmk_extent(t["lmk"])
+            half = t["box_half"] * s
+            ctr = c + t["box_off"] * s
+            lmk = fa.predict_in_bbox(img_bgr, np.concatenate([ctr - half, ctr + half]))
+            c2, s2 = self._lmk_extent(lmk)
+            if np.linalg.norm(c2 - c) <= self.TRACK_MAX_JUMP * s and abs(s2 - s) <= self.TRACK_MAX_JUMP * s:
+                t["lmk"], t["age"] = lmk, t["age"] + 1
+                return [lmk]
+        lmks, bboxes = fa.predict(img_bgr, return_bboxes=True)
+        self._src_track = None
+        if len(lmks) == 1:
+            c, s = self._lmk_extent(lmks[0])
+            b = bboxes[0]
+            self._src_track = {"lmk": lmks[0], "age": 0,
+                               "box_off": (np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2]) - c) / s,
+                               "box_half": np.array([b[2] - b[0], b[3] - b[1]]) / 2 / s}
+        return lmks
+
     def _process_source_frame(self, img_bgr, **kwargs):
         """
         Run face-detect/crop/motion-extract on a single source frame.
@@ -222,7 +261,9 @@ class FasterLivePortraitPipeline:
                 return None
             src_faces.append(lmk)
         else:
-            src_faces = self.model_dict["face_analysis"].predict(img_bgr)
+            src_faces = self._track_source_face(img_bgr) if kwargs.get("track", False) else None
+            if src_faces is None:
+                src_faces = self.model_dict["face_analysis"].predict(img_bgr)
             if len(src_faces) == 0:
                 print("No face detected in the this image.")
                 return None
