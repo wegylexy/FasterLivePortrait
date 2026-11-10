@@ -14,14 +14,20 @@ python inference.py -s <portrait> -d <driving> -o <dir> \
     --flag-normalize-lip --animation-region lip --driving-multiplier 1.2
 """
 import os
+
+# One CPU thread per pool, set before numpy/torch/cv2 load. The per-frame CPU
+# work is many small ops, where the default pools (one thread per core) only spin:
+# measured on the 32-core CI runner, ~10 busy cores vs ~1, at the same or slightly
+# better speed and bit-identical output. Override by setting these in the env.
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 import argparse
-import queue
 import subprocess
-import threading
 import time
 import platform
 import cv2
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline
@@ -45,16 +51,10 @@ if not os.path.isabs(DEFAULT_CFG):
     DEFAULT_CFG = os.path.join(REPO_ROOT, DEFAULT_CFG)
 
 
-def _locked(fn):
-    lock = threading.Lock()
-
-    def wrapper(*a, **k):
-        with lock:
-            return fn(*a, **k)
-    return wrapper
-
-
 def main(args):
+    cpu_threads = int(os.environ["OMP_NUM_THREADS"])
+    torch.set_num_threads(cpu_threads)
+    cv2.setNumThreads(cpu_threads)
     infer_cfg = OmegaConf.load(DEFAULT_CFG)
     infer_cfg.infer_params.flag_pasteback = True
     apply_cli_overrides(infer_cfg, args)
@@ -81,39 +81,9 @@ def main(args):
                               f"{os.path.basename(args.src_image)}-{os.path.basename(args.dri_video)}.mp4")
     vsave_final = os.path.splitext(vsave_path)[0] + "-final.mp4"
 
-    # Three stages run concurrently so the GPU isn't left idle while the CPU
-    # does Python/numpy work: a thread preparing source frames ahead (face
-    # detect, crop, motion/appearance features - independent of the render's
-    # smoothing state, so order and output are unchanged), the render on this
-    # thread, and an encoder thread feeding raw frames straight into ffmpeg.
-    # TRT models share preallocated buffers and the default stream, so each
-    # one is serialised with its own lock (landmark/motion_extractor are used
-    # by both the prep and render stages).
-    for name, model in pipe.model_dict.items():
-        model.predict = _locked(model.predict)
-
-    stop = threading.Event()
-    errors = []
-    src_q = queue.Queue(maxsize=16)
-    enc_q = queue.Queue(maxsize=16)
-
-    def prep_source():
-        try:
-            i = 0
-            while not stop.is_set():
-                item = (pipe.src_imgs[i], pipe.src_infos[i]) if pipe.is_source_video \
-                    else (pipe.src_imgs[0], pipe.src_infos[0])
-                while not stop.is_set():
-                    try:
-                        src_q.put(item, timeout=1)
-                        break
-                    except queue.Full:
-                        pass
-                i += 1
-        except BaseException as e:
-            errors.append(e)
-            stop.set()
-
+    # Deliberately single-threaded: preparing source frames in a parallel thread
+    # only gained ~10% (the stages contend for the GIL) for extra CPU and RAM,
+    # and a separate process was slower still (two CUDA contexts time-slice).
     # -b:v 1M, -c:a copy: matches the non-Faster fork's own CLI output
     # contract exactly (fixed bitrate, audio copied not re-encoded) - the
     # downstream pipeline needs no separate re-compression step.
@@ -132,21 +102,6 @@ def main(args):
     print(f"encoding: {' '.join(enc_args)}", flush=True)
     enc = subprocess.Popen(enc_args, stdin=subprocess.PIPE)
 
-    def encode():
-        try:
-            while True:
-                frame = enc_q.get()
-                if frame is None:
-                    break
-                enc.stdin.write(frame.tobytes())
-        except BaseException as e:
-            errors.append(e)
-            stop.set()
-
-    threads = [threading.Thread(target=prep_source, daemon=True), threading.Thread(target=encode, daemon=True)]
-    for t in threads:
-        t.start()
-
     total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
     infer_times = []
     frame_ind = 0
@@ -159,27 +114,21 @@ def main(args):
     # spamming the log on long runs (e.g. ~60 lines for a 30-minute job).
     HEARTBEAT_SECS = 30
     try:
-        while vcap.isOpened() and not stop.is_set():
+        while vcap.isOpened():
             ret, frame = vcap.read()
             if not ret:
                 break
-            src_img, src_info = None, None
-            while src_img is None and not stop.is_set():
-                try:
-                    src_img, src_info = src_q.get(timeout=1)
-                except queue.Empty:
-                    pass
-            if stop.is_set():
-                break
             t0 = time.time()
             first_frame = frame_ind == 0
-            _, _, out_org, _ = pipe.run(frame, src_img, src_info, first_frame=first_frame)
+            src_idx = frame_ind if pipe.is_source_video else 0
+            _, _, out_org, _ = pipe.run(frame, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
+                                        first_frame=first_frame)
             frame_ind += 1
             if out_org is None:
                 print(f"no face in driving frame:{frame_ind}", flush=True)
                 continue
             infer_times.append(time.time() - t0)
-            enc_q.put(out_org)
+            enc.stdin.write(out_org.tobytes())
             now = time.time()
             if now - last_log_t >= HEARTBEAT_SECS:
                 avg_ms = (now - start_t) / frame_ind * 1000
@@ -187,17 +136,12 @@ def main(args):
                       f"({now - start_t:.1f}s elapsed, {avg_ms:.0f} ms/frame avg)", flush=True)
                 last_log_t = now
     finally:
-        stop.set()
-        enc_q.put(None)
-        threads[1].join()
         vcap.release()
         try:
             enc.stdin.close()
         except OSError:
             pass
         ret = enc.wait()
-    if errors:
-        raise errors[0]
     if ret != 0:
         raise RuntimeError(f"ffmpeg encode failed with exit code {ret}: {' '.join(enc_args)}")
     print(f"render done: {frame_ind} frames in {time.time() - start_t:.1f}s", flush=True)
