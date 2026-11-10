@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # warping+spade model
-python scripts/onnx2trt.py -o ./checkpoints/liveportrait_onnx/warping_spade-fix.onnx
+python scripts/onnx2trt.py -o ./checkpoints/liveportrait_onnx/warping_spade.onnx
 # landmark model
 python scripts/onnx2trt.py -o ./checkpoints/liveportrait_onnx/landmark.onnx
 # motion_extractor model

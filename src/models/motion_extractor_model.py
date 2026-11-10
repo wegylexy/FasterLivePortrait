@@ -45,10 +45,7 @@ class MotionExtractorModel(BaseModel):
         return img[None]
 
     def output_process(self, *data):
-        if self.predict_type == "trt":
-            kp, pitch, yaw, roll, t, exp, scale = data
-        else:
-            pitch, yaw, roll, t, exp, scale, kp = data
+        pitch, yaw, roll, t, exp, scale, kp = data
         if self.flag_refine_info:
             bs = kp.shape[0]
             pitch = headpose_pred_to_degree(pitch)[:, None]  # Bx1
@@ -68,9 +65,8 @@ class MotionExtractorModel(BaseModel):
                 feed_dict[inp['name']] = torch.from_numpy(data[i]).to(device=self.device,
                                                                       dtype=numpy_to_torch_dtype_dict[inp['dtype']])
         preds_dict = self.predictor.predict(feed_dict, self.cudaStream)
-        outs = []
-        for i, out in enumerate(self.predictor.outputs):
-            outs.append(preds_dict[out["name"]].cpu().numpy())
+        # by name, not engine order: TensorRT 8.6 put kp first, TensorRT 11 keeps the ONNX order
+        outs = [preds_dict[name].cpu().numpy() for name in ("pitch", "yaw", "roll", "t", "exp", "scale", "kp")]
         nvtx.range_pop()
         return outs
 

@@ -2,7 +2,7 @@ models:
   warping_spade:
     name: "WarpingSpadeModel"
     predict_type: "trt"
-    model_path: "./checkpoints/liveportrait_onnx/warping_spade-fix.trt"
+    model_path: "./checkpoints/liveportrait_onnx/warping_spade.trt"
   motion_extractor:
     name: "MotionExtractorModel"
     predict_type: "trt"

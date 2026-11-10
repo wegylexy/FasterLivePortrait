@@ -43,11 +43,16 @@ class TensorRTPredictor:
         """
         :param engine_path: The path to the serialized engine to load from disk.
         """
+        # The grid_sample 3D plugin is only needed by TensorRT 8.x engines; TensorRT 11's
+        # built-in GridSample takes 5D input, so engines built with it have no plugin layer.
         if platform.system().lower() == 'linux':
-            ctypes.CDLL("./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so", mode=ctypes.RTLD_GLOBAL)
+            plugin = "./checkpoints/liveportrait_onnx/libgrid_sample_3d_plugin.so"
+            if os.path.exists(plugin):
+                ctypes.CDLL(plugin, mode=ctypes.RTLD_GLOBAL)
         else:
-            ctypes.CDLL("./checkpoints/liveportrait_onnx/grid_sample_3d_plugin.dll", mode=ctypes.RTLD_GLOBAL,
-                        winmode=0)
+            plugin = "./checkpoints/liveportrait_onnx/grid_sample_3d_plugin.dll"
+            if os.path.exists(plugin):
+                ctypes.CDLL(plugin, mode=ctypes.RTLD_GLOBAL, winmode=0)
         # Load TRT engine
         self.logger = trt.Logger(trt.Logger.ERROR)
         trt.init_libnvinfer_plugins(self.logger, "")
