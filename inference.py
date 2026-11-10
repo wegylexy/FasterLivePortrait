@@ -15,7 +15,9 @@ python inference.py -s <portrait> -d <driving> -o <dir> \
 """
 import os
 import argparse
+import queue
 import subprocess
+import threading
 import time
 import platform
 import cv2
@@ -43,6 +45,15 @@ if not os.path.isabs(DEFAULT_CFG):
     DEFAULT_CFG = os.path.join(REPO_ROOT, DEFAULT_CFG)
 
 
+def _locked(fn):
+    lock = threading.Lock()
+
+    def wrapper(*a, **k):
+        with lock:
+            return fn(*a, **k)
+    return wrapper
+
+
 def main(args):
     infer_cfg = OmegaConf.load(DEFAULT_CFG)
     infer_cfg.infer_params.flag_pasteback = True
@@ -66,11 +77,75 @@ def main(args):
     fps = int(vcap.get(cv2.CAP_PROP_FPS))
     h, w = pipe.src_imgs[0].shape[:2]
     save_dir = resolve_save_dir(args)
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     vsave_path = os.path.join(save_dir,
                               f"{os.path.basename(args.src_image)}-{os.path.basename(args.dri_video)}.mp4")
-    vout = cv2.VideoWriter(vsave_path, fourcc, fps, (w, h))
+    vsave_final = os.path.splitext(vsave_path)[0] + "-final.mp4"
+
+    # Three stages run concurrently so the GPU isn't left idle while the CPU
+    # does Python/numpy work: a thread preparing source frames ahead (face
+    # detect, crop, motion/appearance features - independent of the render's
+    # smoothing state, so order and output are unchanged), the render on this
+    # thread, and an encoder thread feeding raw frames straight into ffmpeg.
+    # TRT models share preallocated buffers and the default stream, so each
+    # one is serialised with its own lock (landmark/motion_extractor are used
+    # by both the prep and render stages).
+    for name, model in pipe.model_dict.items():
+        model.predict = _locked(model.predict)
+
+    stop = threading.Event()
+    errors = []
+    src_q = queue.Queue(maxsize=16)
+    enc_q = queue.Queue(maxsize=16)
+
+    def prep_source():
+        try:
+            i = 0
+            while not stop.is_set():
+                item = (pipe.src_imgs[i], pipe.src_infos[i]) if pipe.is_source_video \
+                    else (pipe.src_imgs[0], pipe.src_infos[0])
+                while not stop.is_set():
+                    try:
+                        src_q.put(item, timeout=1)
+                        break
+                    except queue.Full:
+                        pass
+                i += 1
+        except BaseException as e:
+            errors.append(e)
+            stop.set()
+
+    # -b:v 1M, -c:a copy: matches the non-Faster fork's own CLI output
+    # contract exactly (fixed bitrate, audio copied not re-encoded) - the
+    # downstream pipeline needs no separate re-compression step.
+    # -rc cbr must be explicit here: h264_nvenc with -b:v but no explicit
+    # -rc mode hangs indefinitely instead of erroring on this ffmpeg/driver
+    # combo (same underlying issue as the -cq deadlock noted in CLAUDE.md /
+    # NVENC_ARGS elsewhere - any -b:v/-maxrate without an explicit -rc mode
+    # is unsafe here, not just the -cq combination).
+    # Frames are piped raw instead of written to an mp4v intermediate and
+    # re-encoded, which saves a lossy generation and a full second encode.
+    enc_args = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-"]
+    if video_has_audio(args.dri_video):
+        enc_args += ["-i", args.dri_video, "-map", "0:v", "-map", "1:a", "-c:a", "copy", "-shortest"]
+    enc_args += ["-c:v", "h264_nvenc", "-rc", "cbr", "-b:v", "1M", "-pix_fmt", "yuv420p", vsave_final]
+    print(f"encoding: {' '.join(enc_args)}", flush=True)
+    enc = subprocess.Popen(enc_args, stdin=subprocess.PIPE)
+
+    def encode():
+        try:
+            while True:
+                frame = enc_q.get()
+                if frame is None:
+                    break
+                enc.stdin.write(frame.tobytes())
+        except BaseException as e:
+            errors.append(e)
+            stop.set()
+
+    threads = [threading.Thread(target=prep_source, daemon=True), threading.Thread(target=encode, daemon=True)]
+    for t in threads:
+        t.start()
 
     total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
     infer_times = []
@@ -83,52 +158,49 @@ def main(args):
     # visible regardless of per-frame speed or clip length, without
     # spamming the log on long runs (e.g. ~60 lines for a 30-minute job).
     HEARTBEAT_SECS = 30
-    while vcap.isOpened():
-        ret, frame = vcap.read()
-        if not ret:
-            break
-        t0 = time.time()
-        first_frame = frame_ind == 0
-        src_idx = frame_ind if pipe.is_source_video else 0
-        _, _, out_org, _ = pipe.run(frame, pipe.src_imgs[src_idx], pipe.src_infos[src_idx],
-                                    first_frame=first_frame)
-        frame_ind += 1
-        if out_org is None:
-            print(f"no face in driving frame:{frame_ind}", flush=True)
-            continue
-        infer_times.append(time.time() - t0)
-        out_org = cv2.cvtColor(out_org, cv2.COLOR_RGB2BGR)
-        vout.write(out_org)
-        now = time.time()
-        if now - last_log_t >= HEARTBEAT_SECS:
-            avg_ms = (now - start_t) / frame_ind * 1000
-            print(f"progress: frame {frame_ind}/{total_frames or '?'} "
-                  f"({now - start_t:.1f}s elapsed, {avg_ms:.0f} ms/frame avg)", flush=True)
-            last_log_t = now
-    vcap.release()
-    vout.release()
-    print(f"render done: {frame_ind} frames in {time.time() - start_t:.1f}s", flush=True)
-
-    # -b:v 1M, -c:a copy: matches the non-Faster fork's own CLI output
-    # contract exactly (fixed bitrate, audio copied not re-encoded) - the
-    # downstream pipeline needs no separate re-compression step.
-    # -rc cbr must be explicit here: h264_nvenc with -b:v but no explicit
-    # -rc mode hangs indefinitely instead of erroring on this ffmpeg/driver
-    # combo (same underlying issue as the -cq deadlock noted in CLAUDE.md /
-    # NVENC_ARGS elsewhere - any -b:v/-maxrate without an explicit -rc mode
-    # is unsafe here, not just the -cq combination).
-    vsave_final = os.path.splitext(vsave_path)[0] + "-final.mp4"
-    mux_args = [FFMPEG, "-i", vsave_path]
-    if video_has_audio(args.dri_video):
-        mux_args += ["-i", args.dri_video, "-map", "0:v", "-map", "1:a", "-c:a", "copy", "-shortest"]
-    mux_args += ["-c:v", "h264_nvenc", "-rc", "cbr", "-b:v", "1M", vsave_final, "-y"]
-    print(f"muxing: {' '.join(mux_args)}", flush=True)
-    mux_t0 = time.time()
-    ret = subprocess.call(mux_args)
+    try:
+        while vcap.isOpened() and not stop.is_set():
+            ret, frame = vcap.read()
+            if not ret:
+                break
+            src_img, src_info = None, None
+            while src_img is None and not stop.is_set():
+                try:
+                    src_img, src_info = src_q.get(timeout=1)
+                except queue.Empty:
+                    pass
+            if stop.is_set():
+                break
+            t0 = time.time()
+            first_frame = frame_ind == 0
+            _, _, out_org, _ = pipe.run(frame, src_img, src_info, first_frame=first_frame)
+            frame_ind += 1
+            if out_org is None:
+                print(f"no face in driving frame:{frame_ind}", flush=True)
+                continue
+            infer_times.append(time.time() - t0)
+            enc_q.put(out_org)
+            now = time.time()
+            if now - last_log_t >= HEARTBEAT_SECS:
+                avg_ms = (now - start_t) / frame_ind * 1000
+                print(f"progress: frame {frame_ind}/{total_frames or '?'} "
+                      f"({now - start_t:.1f}s elapsed, {avg_ms:.0f} ms/frame avg)", flush=True)
+                last_log_t = now
+    finally:
+        stop.set()
+        enc_q.put(None)
+        threads[1].join()
+        vcap.release()
+        try:
+            enc.stdin.close()
+        except OSError:
+            pass
+        ret = enc.wait()
+    if errors:
+        raise errors[0]
     if ret != 0:
-        raise RuntimeError(f"ffmpeg mux failed with exit code {ret}: {' '.join(mux_args)}")
-    print(f"mux done in {time.time() - mux_t0:.1f}s", flush=True)
-    os.remove(vsave_path)
+        raise RuntimeError(f"ffmpeg encode failed with exit code {ret}: {' '.join(enc_args)}")
+    print(f"render done: {frame_ind} frames in {time.time() - start_t:.1f}s", flush=True)
     print(vsave_final, flush=True)
     print("inference median time: {} ms/frame, mean time: {} ms/frame".format(
         np.median(infer_times) * 1000 if infer_times else 0,
