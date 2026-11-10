@@ -412,12 +412,9 @@ class FasterLivePortraitPipeline:
                     combined_eye_ratio_tensor_before_animation = self.calc_combined_eye_ratio(
                         c_d_eye_before_animation_frame_zero, source_lmk)
                     eye_delta_before_animation = self.retarget_eye(x_s, combined_eye_ratio_tensor_before_animation)
-
-                if not realtime and self.cfg.infer_params.flag_pasteback and self.cfg.infer_params.flag_do_crop and \
-                        self.cfg.infer_params.flag_stitching:
-                    mask_ori_float = prepare_paste_back(self.mask_crop, M.cpu().numpy(),
-                                                        dsize=(self.src_imgs[0].shape[1], self.src_imgs[0].shape[0]))
-                    mask_ori_float = torch.from_numpy(mask_ori_float).to(self.device)
+                # mask_ori_float comes from _process_source_frame, already warped by this frame's M at this
+                # frame's size. Recomputing it here via self.src_imgs[0] made the lazy source reader seek
+                # back to frame 0 and re-prepare it on every frame, then seek forward again.
             else:
                 x_s_info, source_lmk, R_s, f_s, x_s, x_c_s, lip_delta_before_animation, flag_lip_zero, mask_ori_float, M = \
                     src_info[j]
